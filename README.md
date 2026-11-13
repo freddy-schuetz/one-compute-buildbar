@@ -41,8 +41,13 @@ Admin, Funktionen, neue Funktion. Code: [`openwebui/buildbar_zugang.py`](openweb
 | `n8n_url` | `https://n8n.oi.destination.one` |
 | `hub_url` | `https://oi-labor-hub.friedemann-schuetz.eu` (Bereitstellungsdienst für die Apps) |
 | `hub_kurs_geheimnis` | Kurs-Geheimnis des Bereitstellungsdienstes, kommt von Friedemann auf sicherem Weg |
-| `nur_terminal` | `one-compute-buildbar` (schreibt die Zugänge nur in dieses Terminal) |
+| `nur_terminal` | `one-compute-buildbar` (Standard; schreibt die Zugänge nur in dieses Terminal) |
+| `priority` | `-100` (Standard; läuft vor anderen Filtern) |
 
+- **Open WebUI mit `ENABLE_VALVE_ENCRYPTION=true` betreiben** (und auf allen Instanzen derselbe `WEBUI_SECRET_KEY`). Ohne diese
+  Einstellung speichert Open WebUI persönliche Einstellungen im Klartext und schickt sie an den Browser, also auch den
+  n8n-Schlüssel. Wer Funktionen oder Werkzeuge anlegen darf, führt Code auf dem Server aus und kommt damit an alle
+  Einstellungen: dieses Recht nur der Betreuung geben.
 - Am Modell buildbar_ den Filter „buildbar Zugang“ einschalten. Das Modell pflegt Friedemann per Schnittstelle. Bitte
   buildbar_ nicht in der Oberfläche speichern: Dabei geht die Einstellung „Subagents aus“ verloren, weil der Editor
   diesen Schalter nicht zeigt.
@@ -64,13 +69,19 @@ aus, und buildbar_ öffnet ihn nie.
 (n8n, Einstellungen, n8n API, Schlüssel mit allen Rechten erstellen). Zwei Wege:
 
 1. In den Chat einfügen. Der Zusatz erkennt den Schlüssel, ersetzt ihn, bevor das Sprachmodell die Nachricht bekommt,
-   prüft ihn bei n8n und speichert ihn verschlüsselt in den persönlichen Einstellungen. Auch im gespeicherten
-   Chatverlauf und in der Anzeige steht danach nur ein Platzhalter.
+   prüft ihn bei n8n und speichert ihn in den persönlichen Einstellungen. Auch im gespeicherten Chatverlauf und in der
+   Anzeige steht danach nur ein Platzhalter. Übernommen wird nur ein Schlüssel aus der neuesten Nachricht, nie aus
+   einem älteren oder geteilten Verlauf.
 2. Direkt eintragen: im Chat oben rechts „Steuerung“, „Valves“, „Funktionen“, „buildbar Zugang“.
 
 Das Kürzel bildet der Zusatz aus dem Namen: erster Buchstabe des Vornamens und Nachname (höchstens 9 Zeichen, ohne
 Umlaute) plus drei Zeichen aus der Nutzer-ID, zum Beispiel `bhillerbd5`. Es steht in Pfaden, Tabellennamen und
 App-Adressen.
+
+Vor jedem Modellaufruf, auch zwischen zwei Werkzeugaufrufen, blendet der Zusatz n8n-Schlüssel und das Zugangszeichen
+der Person aus allen Nachrichten und Werkzeugausgaben aus. Nach der Antwort bereinigt er die gespeicherten
+Werkzeugdetails. Liest der Assistent also doch einmal eine Zugangsdatei, sieht das Sprachmodell nur einen Platzhalter.
+Schläft das Terminal beim ersten Kontakt, wartet der Zusatz mit einer Statusmeldung bis zu knapp zwei Minuten.
 
 ## Zugänge und Bausteine
 
@@ -103,7 +114,12 @@ Zugängen des Kontos, in dem sie liegen.
 - **Schlüssel eines Admin-Kontos** sehen alle Konten der n8n. `buildbar-status` warnt dann. Für Teilnehmende nur
   Schlüssel normaler Konten.
 - **Der Assistent arbeitet als derselbe Nutzer** wie die Programme im Terminal. Dass er `~/.buildbar` nicht öffnet,
-  regelt seine Anleitung, nicht ein Dateirecht. Die eigentliche Grenze ist das n8n-Konto der Person.
+  regelt seine Anleitung, nicht ein Dateirecht. Eine eingeschleuste Anweisung auf einer Webseite könnte ihn dazu
+  bringen, die Datei hinauszuschicken, ohne dass das Sprachmodell den Schlüssel je sieht. Die eigentliche Grenze ist
+  das n8n-Konto der Person: ein Schlüssel eines normalen Kontos, kein Admin-Schlüssel.
+- **Ereignisse und Protokolle:** Open WebUI schickt die ersten 300 Zeichen jeder neuen Nachricht an eingerichtete
+  Webhooks und Ereignis-Funktionen, bevor der Zusatz läuft. Auf der Protokollstufe DEBUG steht die Anfrage im Log.
+  Beides in Produktion nicht für Chats einschalten.
 
 ## Bauen und aktualisieren
 
