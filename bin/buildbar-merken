@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""buildbar-merken: merkt sich Zugänge (Credentials) aus dem n8n-Konto der Person, damit buildbar_ sie in neuen Workflows
+einsetzen kann. Ein n8n-Schlüssel kann Zugänge nicht auflisten. Deshalb wählt die Person einen Zugang einmal in einem Node
+aus, und dieser Befehl liest Name, Typ und Nummer aus dem Workflow. Gespeichert werden nur diese drei Angaben, nie Schlüssel.
+
+  buildbar-merken aus-workflow <workflow-id>   alle Zugänge merken, die in diesem eigenen Workflow ausgewählt sind
+  buildbar-merken <typ> <nummer> <name ...>   einen Zugang von Hand merken, zum Beispiel: oneIntelligenceApi Ab12Cd34Ef56Gh78 one.intelligence
+  buildbar-merken liste                        gemerkte Zugänge zeigen (Name | Typ | Nummer)
+  buildbar-merken vergessen <nummer>           einen Zugang wieder vergessen
+"""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+DATEI = os.path.join(os.path.expanduser('~'), '.config', 'buildbar', 'zugaenge.json')
+BEKANNT = {'N8N_API_URL', 'N8N_API_KEY'}
+TYP_OK = re.compile(r'^[A-Za-z][A-Za-z0-9]{1,79}$')
+NUMMER_OK = re.compile(r'^[A-Za-z0-9]{8,40}$')
+
+
+def umgebung_laden():
+    """Nur die n8n-Adresse und den n8n-Schlüssel aus ~/.buildbar/zugang.env (gilt vor der Umgebung) und geheim.env."""
+    heim = os.path.join(os.path.expanduser('~'), '.buildbar')
+    for datei, vorrang in ((os.path.join(heim, 'zugang.env'), True), (os.path.join(heim, 'geheim.env'), False)):
+        if not os.path.exists(datei):
+            continue
+        for zeile in open(datei, encoding='utf-8'):
+            k, trenner, v = zeile.strip().partition('=')
+            k, v = k.strip(), v.strip()
+            if trenner and k in BEKANNT and (vorrang or not os.environ.get(k)):
+                os.environ[k] = v
+
+
+def laden():
+    try:
+        with open(DATEI, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def speichern(liste):
+    os.makedirs(os.path.dirname(DATEI), exist_ok=True)
+    tmp = DATEI + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(liste, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, DATEI)
+
+
+def merken(typ, nummer, name, liste):
+    name = re.sub(r'[\r\n\t]+', ' ', str(name or '')).strip()[:120]
+    if not TYP_OK.match(typ or '') or not NUMMER_OK.match(nummer or ''):
+        raise SystemExit(f'Ungültig: Typ „{typ}“ oder Nummer „{nummer}“. Die Nummer besteht aus 8 bis 40 Buchstaben und Ziffern.')
+    liste = [z for z in liste if z.get('id') != nummer]
+    liste.append({'type': typ, 'id': nummer, 'name': name})
+    return liste
+
+
+def zeigen(liste):
+    if not liste:
+        print('Gemerkte Zugänge: noch keine.')
+        return
+    print('Gemerkte Zugänge (Name | Typ | Nummer):')
+    for z in liste:
+        print(f'  {z.get("name")} | {z.get("type")} | {z.get("id")}')
+
+
+def aus_workflow(wid, liste):
+    if not NUMMER_OK.match(wid or ''):
+        raise SystemExit(f'Ungültige Workflow-ID: {wid}')
+    umgebung_laden()
+    schluessel = os.environ.get('N8N_API_KEY', '')
+    if not schluessel:
+        raise SystemExit('Der n8n-Schlüssel fehlt. „buildbar-status“ zeigt, was zu tun ist.')
+    basis = os.environ.get('N8N_API_URL', 'https://n8n.oi.destination.one').rstrip('/')
+    req = urllib.request.Request(f'{basis}/api/v1/workflows/{wid}', headers={'X-N8N-API-KEY': schluessel, 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            wf = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f'Den Workflow {wid} gibt es nicht oder er gehört nicht zu diesem Konto (HTTP {e.code}).')
+    except Exception as e:
+        raise SystemExit(f'n8n ist nicht erreichbar: {type(e).__name__}')
+    if not str(wf.get('name') or '').startswith('buildbar: '):
+        raise SystemExit('Zugänge merkst du dir nur aus eigenen Workflows, deren Name mit „buildbar: “ beginnt.')
+    neu = 0
+    for node in wf.get('nodes') or []:
+        for typ, c in (node.get('credentials') or {}).items():
+            if isinstance(c, dict) and NUMMER_OK.match(str(c.get('id') or '')):
+                liste = merken(typ, c['id'], c.get('name') or typ, liste)
+                neu += 1
+    if not neu:
+        raise SystemExit(f'Im Workflow „{wf.get("name")}“ ist noch kein Zugang ausgewählt. Bitte die Person, ihn im Node auszuwählen '
+                         'und den Workflow zu speichern.')
+    return liste
+
+
+def main(args):
+    liste = laden()
+    if not args or args[0] in ('liste', 'list'):
+        zeigen(liste)
+        return
+    if args[0] in ('hilfe', '-h', '--help'):
+        print(__doc__.strip())
+        return
+    if args[0] == 'aus-workflow' and len(args) == 2:
+        liste = aus_workflow(args[1], liste)
+    elif args[0] == 'vergessen' and len(args) == 2:
+        vorher = len(liste)
+        liste = [z for z in liste if z.get('id') != args[1]]
+        if len(liste) == vorher:
+            raise SystemExit(f'Keinen Zugang mit der Nummer {args[1]} gemerkt.')
+    elif len(args) >= 3:
+        liste = merken(args[0], args[1], ' '.join(args[2:]), liste)
+    else:
+        raise SystemExit(__doc__.strip())
+    speichern(liste)
+    zeigen(liste)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

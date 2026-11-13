@@ -28,7 +28,7 @@ RUN npm install -g --no-audit --no-fund n8n-mcp@2.91.0 \
 COPY bin/ /usr/local/bin/
 COPY lib/ /opt/buildbar/
 RUN chmod 755 /usr/local/bin/app /usr/local/bin/n8n-werkzeug /usr/local/bin/n8n-mcp-start \
-              /usr/local/bin/seite-pruefen /usr/local/bin/buildbar-status \
+              /usr/local/bin/seite-pruefen /usr/local/bin/buildbar-status /usr/local/bin/buildbar-merken \
  && chmod 644 /opt/buildbar/seite-pruefen.js /opt/buildbar/schluessel-laden.sh \
  && node -e "require('/opt/buildbar/node_modules/puppeteer-core/package.json')" \
  && command -v n8n-mcp >/dev/null \
