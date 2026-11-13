@@ -1,66 +1,113 @@
 # one.compute (buildbar_)
 
-Terminal-Image für den Assistenten **buildbar_** auf one.intelligence. Es ist das Open-Terminal-Image, das auch
-one.compute (Advanced) nutzt, plus die Werkzeuge, die buildbar_ braucht. Geheimnisse sind nicht im Image.
+Terminal-Image und Zusatz für den Assistenten **buildbar_** auf one.intelligence. Das Image ist das Open-Terminal-Image,
+das auch one.compute (Advanced) nutzt, plus die Werkzeuge, die buildbar_ braucht. Der Zusatz „buildbar Zugang“ ist eine
+Filterfunktion für Open WebUI. Er legt je Person die Zugänge unsichtbar im Terminal ab. Geheimnisse liegen weder im Image
+noch in diesem Repo.
 
 Image: `ghcr.io/freddy-schuetz/open-terminal:buildbar`
 
 ## Einrichten in one.intelligence (Admin)
 
-1. Admin, Einstellungen, Integrationen, Terminal-Verbindungen: neue Verbindung anlegen oder die vorhandene
-   „one.compute (Advanced)“ kopieren.
-   - Name: `one.compute (buildbar_)`, ID: `one-compute-buildbar`
-   - Bild: `ghcr.io/freddy-schuetz/open-terminal:buildbar`
-   - Chat-Uploads: `Dateisystem` (angehängte Dateien landen im Terminal)
-   - Speicher: dauerhaft, mindestens 2Gi (eine App braucht rund 600 MB; 1Gi reicht für eine App)
-   - CPU: 2, Arbeitsspeicher: 2Gi (Next.js-Builds)
-   - Inaktivitäts-Timeout: für Kurstage 120 Minuten (Pods starten sonst nach jeder Pause neu, rund 90 Sekunden)
-   - Umgebungsvariablen: keine nötig
-2. Speichern, danach „Terminals aktualisieren“.
-3. Am Modell buildbar_ als Standard-Terminal `one-compute-buildbar` eintragen (Arbeitsbereich, Modelle, buildbar_, Terminal).
-4. Die Gruppen, die buildbar_ nutzen, brauchen Zugriff auf die Verbindung („Zugriff“) und Leserecht auf die
-   16 Skills `buildbar-*` (Arbeitsbereich, Skills).
+### 1. Terminal-Verbindung
+
+Admin, Einstellungen, Integrationen, Terminal-Verbindungen: neue Verbindung anlegen oder „one.compute (Advanced)“ kopieren.
+
+| Feld | Wert |
+|---|---|
+| Name, ID | `one.compute (buildbar_)`, `one-compute-buildbar` |
+| Bild | `ghcr.io/freddy-schuetz/open-terminal:buildbar` |
+| Chat-Uploads | `Dateisystem` (angehängte Dateien landen im Terminal) |
+| Speicher | dauerhaft, mindestens 2Gi (eine App braucht rund 600 MB, mit 1Gi ist nach zwei Apps Schluss) |
+| CPU, Arbeitsspeicher | 2 und 2Gi (Next.js-Builds) |
+| Inaktivitäts-Timeout | an Kurstagen 120 Minuten (sonst startet das Terminal nach jeder Pause neu, rund 90 Sekunden) |
+| Umgebungsvariablen | keine |
+
+Speichern, danach „Terminals aktualisieren“. Zugriff für die Gruppen, die buildbar_ nutzen.
 
 Bekannte Falle: Open WebUI lädt die Werkzeugliste der Terminals beim Start und beim Speichern der Verbindungen mit
-`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA` (Standard 10 s). Die erste `openapi.json`-Abfrage eines schlafenden Pods
-dauert 20 bis 30 s. Mit 120 s ist das Terminal zuverlässig in der Liste.
+`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA` (Standard 10 s). Die erste Abfrage eines schlafenden Terminals dauert 20 bis
+30 s. Mit 120 s ist das Terminal zuverlässig in der Liste.
+
+### 2. Zusatz „buildbar Zugang“
+
+Admin, Funktionen, neue Funktion. Code: [`openwebui/buildbar_zugang.py`](openwebui/buildbar_zugang.py).
+
+- ID `buildbar_zugang`, Name `buildbar Zugang`, aktivieren. **Nicht global schalten:** Er gehört nur an das Modell buildbar_.
+- Einstellungen (Valves, nur für Admins sichtbar):
+
+| Valve | Wert |
+|---|---|
+| `n8n_url` | `https://n8n.oi.destination.one` |
+| `hub_url` | `https://oi-labor-hub.friedemann-schuetz.eu` (Bereitstellungsdienst für die Apps) |
+| `hub_kurs_geheimnis` | Kurs-Geheimnis des Bereitstellungsdienstes, kommt von Friedemann auf sicherem Weg |
+| `nur_terminal` | `one-compute-buildbar` (schreibt die Zugänge nur in dieses Terminal) |
+
+- Am Modell buildbar_ den Filter „buildbar Zugang“ einschalten. Das Modell pflegt Friedemann per Schnittstelle. Bitte
+  buildbar_ nicht in der Oberfläche speichern: Dabei geht die Einstellung „Subagents aus“ verloren, weil der Editor
+  diesen Schalter nicht zeigt.
+
+### 3. Modell buildbar_
+
+Standard-Terminal `one-compute-buildbar`. Die Gruppen, die buildbar_ nutzen, brauchen Leserecht auf das Modell und auf
+die 16 Skills `buildbar-*` (Arbeitsbereich, Skills).
+
+## Was je Person passiert
+
+Das Home ist am Anfang leer. Bei jeder Nachricht an buildbar_ schreibt der Zusatz die Datei `~/.buildbar/zugang.env`
+ins Terminal der Person, falls sich etwas geändert hat. Darin stehen Kürzel, Nutzer-ID, die Adressen von n8n und dem
+Bereitstellungsdienst, ein persönliches Zugangszeichen zum Veröffentlichen (HMAC aus dem Kurs-Geheimnis, Kürzel und
+Nutzer-ID) und, sobald vorhanden, der n8n-Schlüssel der Person. Der Ordner ist versteckt, das Dateifenster blendet ihn
+aus, und buildbar_ öffnet ihn nie.
+
+**Die Person tut nur eins: ihren n8n-Schlüssel einmal hinterlegen.** buildbar_ sagt beim ersten Kontakt, wie
+(n8n, Einstellungen, n8n API, Schlüssel mit allen Rechten erstellen). Zwei Wege:
+
+1. In den Chat einfügen. Der Zusatz erkennt den Schlüssel, ersetzt ihn, bevor das Sprachmodell die Nachricht bekommt,
+   prüft ihn bei n8n und speichert ihn verschlüsselt in den persönlichen Einstellungen. Auch im gespeicherten
+   Chatverlauf und in der Anzeige steht danach nur ein Platzhalter.
+2. Direkt eintragen: im Chat oben rechts „Steuerung“, „Valves“, „Funktionen“, „buildbar Zugang“.
+
+Das Kürzel bildet der Zusatz aus dem Namen: erster Buchstabe des Vornamens und Nachname (höchstens 9 Zeichen, ohne
+Umlaute) plus drei Zeichen aus der Nutzer-ID, zum Beispiel `bhillerbd5`. Es steht in Pfaden, Tabellennamen und
+App-Adressen.
+
+## Zugänge und Bausteine
+
+buildbar_ nutzt die Zugänge (Credentials) im n8n-Konto der Person: eigene und solche, die für das Konto freigegeben
+sind. `buildbar-status` listet sie mit Name, Typ und ID. Dafür braucht der n8n-Schlüssel das Recht, Zugänge aufzulisten
+(`credential:list`). KI läuft über den n8n-Node von one.intelligence (`CUSTOM.lmChatOneIntelligence`, Zugang vom Typ
+`oneIntelligenceApi`), getestet mit `claude-sonnet-5-5`, `claude-haiku-5-5` und `local/gemma-4-31B`.
+
+Die fünf Bausteine (Google, Tripadvisor, OpenStreetMap, Website, Webseite lesen) sind ein Angebot, keine Pflicht. Sie
+liegen in einem n8n-Konto und sind für jeden Workflow der Instanz aufrufbar (`callerPolicy: any`). Sie laufen mit den
+Zugängen des Kontos, in dem sie liegen.
 
 ## Was im Image liegt
 
 | Pfad | Zweck |
 |---|---|
-| `/usr/local/bin/buildbar-status` | zeigt, was eingerichtet ist und was fehlt (ohne Schlüssel auszugeben) |
+| `/usr/local/bin/buildbar-status` | zeigt, was eingerichtet ist und was fehlt, ohne Schlüssel auszugeben |
 | `/usr/local/bin/n8n-werkzeug` | ruft die n8n-mcp-Werkzeuge im n8n-Konto der Person auf |
-| `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge, Instanz-Audit) |
+| `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge und Instanz-Audit) |
 | `/usr/local/bin/app` | App anlegen, auflisten, veröffentlichen (über den Bereitstellungsdienst) |
-| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner/Handy, Überbreite, Kontrast, Fehler |
+| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy, Überbreite, Kontrast, Fehler |
 | `/opt/buildbar/` | `seite-pruefen.js`, `puppeteer-core`, `schluessel-laden.sh` |
 | aus dem Basis-Image | Node 22, Python 3.12, Git, Chromium, curl, sudo |
 
-Nicht im Image: OpenCode (nur für den späteren Brücken-Betrieb), Bausteine und Zugänge (liegen in n8n).
+## Bekannte Grenzen
 
-## Je Person: eine Datei mit Schlüsseln
-
-Das Home ist am Anfang leer. buildbar_ ruft beim ersten Kontakt `buildbar-status` auf und sagt der Person, was
-fehlt. Die Person legt dann rechts im Terminal (Reiter Dateien) die Datei `/home/user/schluessel.txt` an:
-
-```
-KUERZEL=bhil
-N8N_API_KEY=<aus n8n: Einstellungen, n8n API, Schlüssel erstellen>
-HUB_TOKEN=<Zugang zum Veröffentlichen, kommt von der Betreuung>
-```
-
-Optional, falls im eigenen n8n-Konto Zugänge liegen: `CRED_KI=<id>`, `CRED_DATAFORSEO=<id>`, `CRED_APIFY=<id>`.
-Die Schlüssel gehen nie durch den Chat. `~/.buildbar/geheim.env` wird weiter gelesen (alte Einrichtung).
-
-## Bausteine
-
-Die fünf Bausteine (Google, Tripadvisor, OpenStreetMap, Website, Webseite lesen) liegen in einem n8n-Konto und sind
-für jeden Workflow der Instanz aufrufbar (`callerPolicy: any`). Die IDs stehen im Systemprompt von buildbar_. Zugänge
-für DataForSEO, Apify und KI stecken in den Bausteinen, die Personen brauchen keine eigenen.
+- **Erste Nachricht eines neuen Chats:** Open WebUI erzeugt den Chat-Titel, bevor der Zusatz läuft. Steht der Schlüssel
+  schon im allerersten Satz eines neuen Chats, bekommt ihn das Modell für den Titel einmal zu sehen. buildbar_ fragt
+  erst nach der ersten Nachricht nach dem Schlüssel, im normalen Ablauf passiert das also nicht.
+- **Schlüssel eines Admin-Kontos** sehen alle Konten der n8n. `buildbar-status` warnt dann. Für Teilnehmende nur
+  Schlüssel normaler Konten.
+- **Der Assistent arbeitet als derselbe Nutzer** wie die Programme im Terminal. Dass er `~/.buildbar` nicht öffnet,
+  regelt seine Anleitung, nicht ein Dateirecht. Die eigentliche Grenze ist das n8n-Konto der Person.
 
 ## Bauen und aktualisieren
 
 Jeder Push auf `main` baut das Image über GitHub Actions und schiebt es nach GHCR (`:buildbar` und `:buildbar-<sha>`).
-Lokal: `docker build -t one-compute-buildbar .` und `docker run --rm -it one-compute-buildbar bash`, dann
+Lokal: `docker build -t one-compute-buildbar .` und `docker run --rm -it --entrypoint bash one-compute-buildbar`, dann
 `buildbar-status`. Versionen: n8n-mcp 2.91.0, puppeteer-core 23.11.1, Basis open-terminal 0.17.7 (im Dockerfile).
+Der Zusatz liegt unter `openwebui/` und wird in Open WebUI aktualisiert, nicht über das Image.

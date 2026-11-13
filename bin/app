@@ -18,18 +18,24 @@ import time
 import urllib.error
 import urllib.request
 
+BEKANNT = {'ZUSATZ', 'KUERZEL', 'PERSON_ID', 'N8N_API_URL', 'N8N_API_KEY', 'OIL_HUB_URL', 'OIL_HUB_TOKEN'}
+GEHEIM = ('N8N_API_KEY', 'OIL_HUB_TOKEN', 'HUB_TOKEN', 'OI_API_KEY')
+
+
 def _umgebung_laden():
-    """Schlüssel der Person aus ~/schluessel.txt (und ~/.buildbar/geheim.env) übernehmen. HUB_TOKEN = OIL_HUB_TOKEN."""
-    for datei in (os.path.join(os.path.expanduser('~'), 'schluessel.txt'),
-                  os.path.join(os.path.expanduser('~'), '.buildbar', 'geheim.env')):
+    """Zugänge der Person übernehmen: ~/.buildbar/zugang.env (vom Zusatz „buildbar Zugang“, gilt vor den
+    Standardwerten des Images) und ~/.buildbar/geheim.env (alte Einrichtung, füllt nur Lücken). Nur bekannte Namen,
+    nie Variablen wie PATH oder NODE_OPTIONS. HUB_TOKEN = OIL_HUB_TOKEN."""
+    heim = os.path.join(os.path.expanduser('~'), '.buildbar')
+    for datei, vorrang in ((os.path.join(heim, 'zugang.env'), True), (os.path.join(heim, 'geheim.env'), False)):
         if not os.path.exists(datei):
             continue
         for zeile in open(datei, encoding='utf-8'):
-            k, _, v = zeile.strip().partition('=')
+            k, trenner, v = zeile.strip().partition('=')
             k, v = k.strip(), v.strip()
             if k == 'HUB_TOKEN':
                 k = 'OIL_HUB_TOKEN'
-            if k and not k.startswith('#') and not os.environ.get(k):
+            if trenner and k in BEKANNT and (vorrang or not os.environ.get(k)):
                 os.environ[k] = v
     os.environ.setdefault('NPM_CONFIG_CACHE', '/var/tmp/buildbar/npm-cache')
 
@@ -42,7 +48,8 @@ PLATZ_MB = 800  # so viel soll im Home frei sein, bevor Pakete installiert werde
 
 
 def hub(methode, pfad, body=None, timeout=120):
-    h = {'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/json'}
+    h = {'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/json',
+         'X-Kuerzel': os.environ.get('KUERZEL', ''), 'X-Person-Id': os.environ.get('PERSON_ID', '')}
     daten = None
     if body is not None:
         daten = json.dumps(body).encode()
@@ -93,11 +100,17 @@ def meta(ordner):
     return b
 
 
+def _umgebung_ohne_geheimes():
+    env = {k: v for k, v in os.environ.items() if k not in GEHEIM}
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    return env
+
+
 def lauf(cmd, cwd, log=None):
     if log:
         with open(log, 'w') as f:
-            return subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT).returncode
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            return subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env=_umgebung_ohne_geheimes()).returncode
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=_umgebung_ohne_geheimes())
 
 
 def platz_schaffen(behalten):
@@ -136,7 +149,38 @@ def vorlage_fuer_oi(ziel):
             open(p, 'w', encoding='utf-8', newline='\n').write(t2)
 
 
+GIT_INTERN = 'http://oil-gitea:3000/'
+
+
+def git_zugang():
+    """Richtet Git für den Bereitstellungsdienst ein, falls noch nicht geschehen: öffentliche Gitea-Adresse statt der
+    internen, und im Kurs das persönliche Git-Token aus /person. Gibt keine Werte aus."""
+    os.makedirs(APPS, exist_ok=True)
+    s, b = hub('GET', '/person')
+    if s != 200:
+        return
+    git_url = (b.get('git_url') or '').rstrip('/')
+    if not git_url:
+        return
+    lauf(['git', 'config', '--global', f'url.{git_url}/.insteadOf', GIT_INTERN], APPS)
+    if not subprocess.run(['git', 'config', '--global', 'user.name'], capture_output=True, text=True).stdout.strip():
+        lauf(['git', 'config', '--global', 'user.name', b.get('person') or 'buildbar'], APPS)
+        lauf(['git', 'config', '--global', 'user.email', (b.get('person') or 'buildbar') + '@buildbar.local'], APPS)
+    lauf(['git', 'config', '--global', 'init.defaultBranch', 'main'], APPS)
+    token = b.get('git_token')
+    if not token:
+        return
+    lauf(['git', 'config', '--global', 'credential.helper', 'store'], APPS)
+    host = git_url.split('//', 1)[-1]
+    pfad = os.path.join(os.path.expanduser('~'), '.git-credentials')
+    alt = open(pfad, encoding='utf-8').read().splitlines() if os.path.exists(pfad) else []
+    neu_ = [z for z in alt if host not in z] + [f'https://{b["person"]}:{token}@{host}']
+    with open(os.open(pfad, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(neu_) + '\n')
+
+
 def neu(name, titel=''):
+    git_zugang()
     s, b = hub('POST', '/apps', {'name': name, 'titel': titel})
     if s not in (200, 201):
         raus('FEHLER: ' + b.get('fehler', f'HTTP {s}') + (('\n' + b['details']) if b.get('details') else ''))
@@ -201,8 +245,11 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung'):
     os.makedirs(os.path.join(o, 'public'), exist_ok=True)
     with open(os.path.join(o, 'public', 'version.txt'), 'w') as f:
         f.write(marke + '\n')
+    git_zugang()
     lauf(['git', 'add', '-A'], o)
-    lauf(['git', 'commit', '-q', '-m', nachricht], o)
+    c = lauf(['git', 'commit', '-q', '-m', nachricht], o)
+    if c.returncode != 0 and 'nothing to commit' not in (c.stdout + c.stderr):
+        raus('COMMIT FEHLGESCHLAGEN: ' + (c.stderr or c.stdout)[-400:])
     print('2/4 Übertrage den Stand nach Gitea ...', flush=True)
     r = lauf(['git', 'push', '-q', 'origin', 'HEAD:main'], o)
     if r.returncode != 0:
@@ -235,7 +282,7 @@ if __name__ == '__main__':
     if not a or a[0] in ('hilfe', '-h', '--help'):
         raus(__doc__, 0)
     if not TOKEN:
-        raus('Der Zugang zum Veröffentlichen fehlt (HUB_TOKEN in /home/user/schluessel.txt). „buildbar-status“ zeigt, was zu tun ist.')
+        raus('Der Zugang zum Veröffentlichen fehlt. „buildbar-status“ zeigt, was zu tun ist.')
     befehl = a[0]
     if befehl == 'neu' and len(a) >= 2:
         neu(a[1], ' '.join(a[2:]))

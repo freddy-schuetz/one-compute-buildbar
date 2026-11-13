@@ -2,7 +2,8 @@
 # Basis ist das Open-Terminal-Image, das auch one.compute (Advanced) nutzt. Dazu kommen die Werkzeuge,
 # die der Assistent buildbar_ braucht. Das Home (/home/user) wird beim Start als dauerhafter Speicher
 # darübergelegt, deshalb liegt hier nichts im Home: Programme unter /usr/local/bin und /opt/buildbar.
-# Geheimnisse sind nicht im Image. Je Person: /home/user/schluessel.txt (siehe README.md).
+# Geheimnisse sind nicht im Image. Je Person schreibt der Zusatz „buildbar Zugang“ in one.intelligence die Datei
+# ~/.buildbar/zugang.env (siehe README.md).
 FROM ghcr.io/open-webui/open-terminal:0.17.7
 
 LABEL org.opencontainers.image.title="one.compute (buildbar_)" \
@@ -11,7 +12,7 @@ LABEL org.opencontainers.image.title="one.compute (buildbar_)" \
 
 USER root
 
-# Standardwerte für alle Personen (ohne Geheimnisse); schluessel.txt kann sie überschreiben
+# Standardwerte für alle Personen (ohne Geheimnisse); ~/.buildbar/zugang.env kann sie überschreiben
 ENV N8N_API_URL=https://n8n.oi.destination.one \
     OIL_HUB_URL=https://oi-labor-hub.friedemann-schuetz.eu \
     NPM_CONFIG_CACHE=/var/tmp/buildbar/npm-cache \
@@ -21,8 +22,8 @@ ENV N8N_API_URL=https://n8n.oi.destination.one \
 RUN npm install -g --no-audit --no-fund n8n-mcp@2.91.0 \
  && mkdir -p /opt/buildbar /var/tmp/buildbar \
  && cd /opt/buildbar && npm install --no-audit --no-fund --no-save puppeteer-core@23.11.1 \
- && chown -R user:user /var/tmp/buildbar \
- && npm cache clean --force 2>/dev/null || true
+ && (npm cache clean --force 2>/dev/null || true) \
+ && chown -R user:user /var/tmp/buildbar
 
 COPY bin/ /usr/local/bin/
 COPY lib/ /opt/buildbar/
@@ -30,7 +31,8 @@ RUN chmod 755 /usr/local/bin/app /usr/local/bin/n8n-werkzeug /usr/local/bin/n8n-
               /usr/local/bin/seite-pruefen /usr/local/bin/buildbar-status \
  && chmod 644 /opt/buildbar/seite-pruefen.js /opt/buildbar/schluessel-laden.sh \
  && node -e "require('/opt/buildbar/node_modules/puppeteer-core/package.json')" \
- && n8n-mcp --version >/dev/null 2>&1 || true
+ && command -v n8n-mcp >/dev/null \
+ && rm -rf /usr/local/bin/__pycache__
 
 USER user
 WORKDIR /home/user

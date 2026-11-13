@@ -1,11 +1,31 @@
 #!/usr/bin/env bash
-# buildbar-status: zeigt dem Assistenten beim ersten Kontakt, was eingerichtet ist und was fehlt.
-# Gibt nie Schlüssel aus, nur ob sie da sind und ob sie funktionieren. Beendet sich immer mit 0.
+# buildbar-status: zeigt dem Assistenten, was eingerichtet ist und was fehlt.
+# Gibt nie Schlüssel aus, nur ob sie da sind und ob sie funktionieren. Schlüssel gehen über die Standardeingabe an curl,
+# nicht über die Befehlszeile (die sieht jede Prozessliste). Beendet sich immer mit 0.
 . /opt/buildbar/schluessel-laden.sh
 N8N="${N8N_API_URL:-https://n8n.oi.destination.one}"
+N8N="${N8N%/}"
 HUB="${OIL_HUB_URL:-https://oi-labor-hub.friedemann-schuetz.eu}"
-DATEI="$HOME/schluessel.txt"
+HUB="${HUB%/}"
 fehlt=()
+
+n8n_anfrage() {  # $1 Pfad, weitere Argumente gehen an curl
+  local pfad="$1"; shift
+  printf 'header = "X-N8N-API-KEY: %s"\n' "$N8N_API_KEY" | curl -K - -s -m 20 "$@" "$N8N$pfad"
+}
+hub_anfrage() {  # $1 Pfad, weitere Argumente gehen an curl
+  local pfad="$1"; shift
+  printf 'header = "Authorization: Bearer %s"\n' "$OIL_HUB_TOKEN" | curl -K - -s -m 20 \
+    -H "X-Kuerzel: ${KUERZEL:-}" -H "X-Person-Id: ${PERSON_ID:-}" "$@" "$HUB$pfad"
+}
+
+# Einen n8n-Schlüssel in den Chat einfügen ist nur sicher, wenn der Zusatz „buildbar Zugang“ in one.intelligence aktiv
+# ist: Er fängt den Schlüssel ab, bevor das Modell ihn sieht, und schreibt beim Ablegen ZUSATZ=1 in die Zugangsdatei.
+if [ -n "${ZUSATZ:-}" ]; then
+  neuer_schluessel="neuen Schlüssel mit allen Rechten anlegen und in den Chat einfügen (der Zusatz „buildbar Zugang“ fängt ihn ab)"
+else
+  neuer_schluessel="die Betreuung fragen. Keinen Schlüssel in den Chat einfügen: Der Zusatz, der ihn dort abfängt, ist hier nicht aktiv"
+fi
 
 echo "buildbar-Arbeitsplatz"
 echo "Werkzeuge: node $(node --version 2>/dev/null || echo fehlt), n8n-mcp $(command -v n8n-mcp >/dev/null && echo da || echo fehlt), chromium $([ -x /usr/bin/chromium ] && echo da || echo fehlt), seite-pruefen $([ -f /opt/buildbar/seite-pruefen.js ] && echo da || echo fehlt)"
@@ -13,53 +33,77 @@ echo "Speicher im Home: $(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4 " fre
 
 if [ -n "${KUERZEL:-}" ]; then
   echo "Kürzel: $KUERZEL"
+elif [ ! -f "$HOME/.buildbar/zugang.env" ]; then
+  echo "Kürzel: fehlt (die Zugangsdatei ist noch nicht da)"
+  fehlt+=("DATEI")
 else
   echo "Kürzel: fehlt"
-  fehlt+=("KUERZEL")
+  fehlt+=("ZUSATZ")
 fi
 
 if [ -n "${N8N_API_KEY:-}" ]; then
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "X-N8N-API-KEY: $N8N_API_KEY" "$N8N/api/v1/workflows?limit=1")
+  code=$(n8n_anfrage "/api/v1/workflows?limit=1" -o /dev/null -w '%{http_code}')
   case "$code" in
-    200) echo "n8n: verbunden ($N8N)" ;;
-    401|403) echo "n8n: Schlüssel wird abgelehnt (HTTP $code). Bitte neuen Schlüssel in n8n anlegen (Einstellungen, API)."; fehlt+=("N8N_API_KEY") ;;
+    200) echo "n8n: verbunden ($N8N)"
+         # Ein Admin-Schlüssel sieht alle Konten der n8n (die Nutzerliste geht nur für Admins)
+         ucode=$(n8n_anfrage "/api/v1/users?limit=1" -o /dev/null -w '%{http_code}')
+         [ "$ucode" = "200" ] && echo "n8n: ACHTUNG, der Schlüssel gehört einem Admin-Konto und sieht alle Konten dieser n8n. Nur für Tests der Betreuung; du arbeitest trotzdem nur mit Workflows, die mit „buildbar: “ beginnen."
+         # Zugänge im n8n-Konto der Person: Name, Typ, ID. Braucht das Recht „credential:list“ am Schlüssel.
+         antwort=$(n8n_anfrage "/api/v1/credentials?limit=250")
+         python3 - "$antwort" "$neuer_schluessel" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except ValueError:
+    print("Zugänge im n8n-Konto: Antwort nicht lesbar"); sys.exit()
+if isinstance(d, dict) and d.get("message") and not d.get("data"):
+    print("Zugänge im n8n-Konto: nicht abrufbar (" + str(d.get("message")) + "). Dem n8n-Schlüssel fehlt das Recht, Zugänge aufzulisten (credential:list). Abhilfe: " + sys.argv[2] + ".")
+    sys.exit()
+liste = d.get("data", d) if isinstance(d, dict) else d
+if not liste:
+    print("Zugänge im n8n-Konto: keine. Dann gehen offene Datenquellen und die Bausteine.")
+else:
+    print("Zugänge im n8n-Konto (Name | Typ | ID):")
+    for c in liste:
+        print("  " + str(c.get("name")) + " | " + str(c.get("type")) + " | " + str(c.get("id")))
+PY
+         ;;
+    401|403) echo "n8n: Schlüssel wird abgelehnt (HTTP $code)."; fehlt+=("N8N_API_KEY") ;;
     *) echo "n8n: nicht erreichbar (HTTP $code)" ;;
   esac
 else
   echo "n8n: Schlüssel fehlt"
-  fehlt+=("N8N_API_KEY")
+  # Fehlt die ganze Zugangsdatei, kommt zuerst die Bitte, die Nachricht noch einmal zu schicken
+  [ -f "$HOME/.buildbar/zugang.env" ] && fehlt+=("N8N_API_KEY")
 fi
 
 if [ -n "${OIL_HUB_TOKEN:-}" ]; then
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "Authorization: Bearer $OIL_HUB_TOKEN" "$HUB/apps")
+  code=$(hub_anfrage "/person" -o /dev/null -w '%{http_code}')
   case "$code" in
     200) echo "Veröffentlichen: verbunden ($HUB)" ;;
-    401|403) echo "Veröffentlichen: Zugang wird abgelehnt (HTTP $code). Bitte die Betreuung fragen."; fehlt+=("HUB_TOKEN") ;;
+    401|403) echo "Veröffentlichen: Zugang wird abgelehnt (HTTP $code)."; fehlt+=("ZUSATZ") ;;
     *) echo "Veröffentlichen: Dienst nicht erreichbar (HTTP $code)" ;;
   esac
-else
+elif [[ " ${fehlt[*]} " != *" DATEI "* ]]; then
   echo "Veröffentlichen: Zugang fehlt"
-  fehlt+=("HUB_TOKEN")
+  fehlt+=("ZUSATZ")
 fi
-
-for z in CRED_KI:"buildbar KI" CRED_DATAFORSEO:"buildbar DataForSEO" CRED_APIFY:"buildbar Apify"; do
-  k="${z%%:*}"; n="${z#*:}"
-  w="${!k:-}"
-  [ -n "$w" ] && echo "Zugang im n8n-Konto: $n (ID $w)"
-done
 
 if [ ${#fehlt[@]} -gt 0 ]; then
   echo
-  echo "ES FEHLT: ${fehlt[*]}"
-  echo "Die Person legt dafür die Datei $DATEI an (rechts im Terminal, Reiter Dateien), eine Zeile je Wert:"
-  for k in "${fehlt[@]}"; do
+  echo "ES FEHLT:"
+  printf '%s\n' "${fehlt[@]}" | sort -u | while read -r k; do
     case "$k" in
-      KUERZEL) echo "  KUERZEL=<kurzes Kürzel, Kleinbuchstaben, z. B. bhil>" ;;
-      N8N_API_KEY) echo "  N8N_API_KEY=<API-Schlüssel aus n8n: Einstellungen, n8n API, Schlüssel erstellen>" ;;
-      HUB_TOKEN) echo "  HUB_TOKEN=<Zugang zum Veröffentlichen, kommt von der Betreuung>" ;;
+      DATEI) echo "  Die Zugangsdatei ist noch nicht da. Das passiert, wenn das Terminal gerade erst gestartet ist: Bitte die Person, ihre Nachricht einfach noch einmal zu schicken. Kommt das beim zweiten Mal wieder: Der Zusatz „buildbar Zugang“ ist nicht aktiv, Betreuung fragen." ;;
+      N8N_API_KEY)
+        if [ -n "${ZUSATZ:-}" ]; then
+          echo "  n8n-Schlüssel: Die Person öffnet n8n ($N8N), klickt unten links auf ihren Namen, dann „Settings“ (Einstellungen), „n8n API“ und „Create an API key“ (Schlüssel erstellen, alle Rechte anhaken), kopiert den Schlüssel und fügt ihn hier in den Chat ein. Der Zusatz „buildbar Zugang“ fängt ihn ab und speichert ihn, du bekommst ihn nicht zu sehen. Danach buildbar-status erneut aufrufen."
+        else
+          echo "  n8n-Schlüssel: Bitte die Betreuung fragen. Die Person fügt keinen Schlüssel in den Chat ein, solange der Zusatz „buildbar Zugang“ nicht aktiv ist."
+        fi ;;
+      ZUSATZ) echo "  Kürzel und Zugang zum Veröffentlichen fehlen: Der Zusatz „buildbar Zugang“ ist in one.intelligence nicht aktiv. Bitte die Betreuung fragen." ;;
     esac
   done
-  echo "Danach noch einmal buildbar-status aufrufen."
 else
   echo
   echo "ALLES BEREIT."

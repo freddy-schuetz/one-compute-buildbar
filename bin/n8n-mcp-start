@@ -1,11 +1,26 @@
 #!/usr/bin/env bash
 # n8n-Verbindung des Assistenten (n8n-mcp über stdio). Die Standardausgabe gehört dem Protokoll,
-# alles andere geht ins Log /tmp/n8n-mcp.log. Aufgerufen von n8n-werkzeug.
+# alles andere geht ins Log /tmp/n8n-mcp.log, mit ausgeblendetem Schlüssel. Aufgerufen von n8n-werkzeug.
 . /opt/buildbar/schluessel-laden.sh
 export N8N_API_URL="${N8N_API_URL:-https://n8n.oi.destination.one}"
 export MCP_MODE=stdio
 export LOG_LEVEL=error
 export DISABLE_CONSOLE_OUTPUT=true
-# Im n8n-Konto der Person liegen auch andere Workflows: Löschen, Zugänge und das Instanz-Audit gibt es nicht.
-export DISABLED_TOOLS="n8n_delete_workflow,n8n_manage_credentials,n8n_audit_instance"
-exec n8n-mcp 2>> /tmp/n8n-mcp.log
+# Im n8n-Konto der Person liegen auch andere Workflows, Ordner und Tabellen: kein Löschen, keine Zugänge, kein
+# Instanz-Audit, keine n8n-Agenten und Evaluations; Ordner nicht löschen, verschieben oder umbenennen (Löschen archiviert
+# die Workflows darin), Versionen nicht löschen oder zurückspielen, Ausführungen und Tabellen nicht löschen.
+export DISABLED_TOOLS="n8n_delete_workflow,n8n_manage_credentials,n8n_audit_instance,n8n_manage_agents,n8n_evaluations"
+export DISABLED_TOOL_OPERATIONS="n8n_manage_folders:delete,move,rename;n8n_workflow_versions:delete,prune,rollback;n8n_executions:delete;n8n_manage_datatable:deletetable"
+if [ -n "${N8N_API_KEY:-}" ]; then
+  # Fehlermeldungen können Anfragen samt Kopfzeilen enthalten: den Schlüssel vor dem Schreiben ins Log ersetzen
+  exec n8n-mcp 2> >(BB_SCHLUESSEL="$N8N_API_KEY" python3 -u -c '
+import os, sys
+s = os.environ.pop("BB_SCHLUESSEL", "")
+with open("/tmp/n8n-mcp.log", "a", encoding="utf-8", errors="replace") as log:
+    for zeile in sys.stdin:
+        log.write(zeile.replace(s, "[Schlüssel ausgeblendet]") if s else zeile)
+        log.flush()
+')
+else
+  exec n8n-mcp 2>> /tmp/n8n-mcp.log
+fi
