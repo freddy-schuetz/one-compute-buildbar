@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# seite-pruefen: Oberfläche einer App im Browser prüfen (Bild am Rechner und auf dem Handy, Überbreite,
+# Kontrast, Fehler). Hilfe: seite-pruefen hilfe
+SEITE_PRUEFEN_MODUL=/opt/buildbar/node_modules/puppeteer-core exec node /opt/buildbar/seite-pruefen.js "$@"

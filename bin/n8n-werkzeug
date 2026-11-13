@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""n8n-werkzeug: die Werkzeuge von n8n-mcp im Terminal aufrufen (für das buildbar_-Modell im Chat von one.intelligence).
+
+  n8n-werkzeug liste                          alle Werkzeuge mit Kurzbeschreibung
+  n8n-werkzeug hilfe <werkzeug>               Beschreibung und Eingabefelder (JSON-Schema)
+  n8n-werkzeug <werkzeug> --datei <pfad>      Aufruf, Argumente als JSON-Datei (für Workflows und große Eingaben)
+  n8n-werkzeug <werkzeug> '<json>'            Aufruf, Argumente direkt als JSON (für kurze Eingaben)
+  n8n-werkzeug <werkzeug>                     Aufruf ohne Argumente
+
+Die Namen sind dieselben wie in den Skills, zum Beispiel n8n_health_check, search_nodes, get_node, n8n_create_workflow,
+n8n_update_partial_workflow, n8n_validate_workflow, n8n_test_workflow, n8n_executions.
+"""
+import json
+import os
+import subprocess
+import sys
+
+START = '/usr/local/bin/n8n-mcp-start'
+
+
+class Verbindung:
+    def __init__(self):
+        self.p = subprocess.Popen([START], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, encoding='utf-8', bufsize=1)
+        self.nr = 0
+        self.anfrage('initialize', {'protocolVersion': '2025-03-26', 'capabilities': {},
+                                    'clientInfo': {'name': 'n8n-werkzeug', 'version': '1.0'}})
+        self.senden({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+
+    def senden(self, nachricht):
+        self.p.stdin.write(json.dumps(nachricht) + '\n')
+        self.p.stdin.flush()
+
+    def anfrage(self, methode, params):
+        self.nr += 1
+        self.senden({'jsonrpc': '2.0', 'id': self.nr, 'method': methode, 'params': params})
+        while True:
+            zeile = self.p.stdout.readline()
+            if not zeile:
+                raise SystemExit('FEHLER: Die n8n-Verbindung hat sich beendet. Fehlt der n8n-Schlüssel? „buildbar-status“ zeigt es. Protokoll: /tmp/n8n-mcp.log')
+            try:
+                d = json.loads(zeile)
+            except ValueError:
+                continue
+            if d.get('id') == self.nr:
+                if 'error' in d:
+                    raise SystemExit('FEHLER: ' + json.dumps(d['error'], ensure_ascii=False))
+                return d.get('result') or {}
+
+    def schliessen(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=5)
+        except Exception:
+            self.p.kill()
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ('-h', '--help', 'hilfe') and len(a) == 1:
+        print(__doc__)
+        return
+    v = Verbindung()
+    try:
+        if a[0] == 'liste':
+            for t in v.anfrage('tools/list', {}).get('tools', []):
+                erste = (t.get('description') or '').strip().splitlines()[0][:150] if t.get('description') else ''
+                print(f"{t['name']}: {erste}")
+            return
+        if a[0] == 'hilfe' and len(a) == 2:
+            for t in v.anfrage('tools/list', {}).get('tools', []):
+                if t['name'] == a[1]:
+                    print(t.get('description', ''))
+                    print('\nEingabe (JSON-Schema):')
+                    print(json.dumps(t.get('inputSchema', {}), ensure_ascii=False, indent=1))
+                    return
+            raise SystemExit(f'Werkzeug {a[1]} gibt es nicht. „n8n-werkzeug liste“ zeigt alle.')
+        name, rest = a[0], a[1:]
+        if rest[:1] == ['--datei'] and len(rest) == 2:
+            with open(rest[1], encoding='utf-8') as f:
+                argumente = json.load(f)
+        elif rest:
+            argumente = json.loads(' '.join(rest))
+        else:
+            argumente = {}
+        ergebnis = v.anfrage('tools/call', {'name': name, 'arguments': argumente})
+        teile = []
+        for inhalt in ergebnis.get('content', []):
+            teile.append(inhalt.get('text', '') if inhalt.get('type') == 'text' else json.dumps(inhalt, ensure_ascii=False))
+        print('\n'.join(teile) if teile else json.dumps(ergebnis, ensure_ascii=False))
+        if ergebnis.get('isError'):
+            sys.exit(1)
+    finally:
+        v.schliessen()
+
+
+if __name__ == '__main__':
+    main()

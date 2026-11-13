@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""app: eigene Apps anlegen, auflisten und veroeffentlichen (buildbar auf one.intelligence).
+
+  app neu <name> ["Titel"]          neue App mit eigener Adresse, Ordner ~/apps/<name>
+  app liste                         alle eigenen Apps mit Adresse und Stand
+  app status [<name>]               Stand einer App (ohne Name: die App im aktuellen Ordner)
+  app veroeffentlichen [<name>] ["Nachricht"]
+                                    Build pruefen, nach Gitea uebertragen, warten bis die neue Fassung live ist
+"""
+import glob
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+def _umgebung_laden():
+    """Schlüssel der Person aus ~/schluessel.txt (und ~/.buildbar/geheim.env) übernehmen. HUB_TOKEN = OIL_HUB_TOKEN."""
+    for datei in (os.path.join(os.path.expanduser('~'), 'schluessel.txt'),
+                  os.path.join(os.path.expanduser('~'), '.buildbar', 'geheim.env')):
+        if not os.path.exists(datei):
+            continue
+        for zeile in open(datei, encoding='utf-8'):
+            k, _, v = zeile.strip().partition('=')
+            k, v = k.strip(), v.strip()
+            if k == 'HUB_TOKEN':
+                k = 'OIL_HUB_TOKEN'
+            if k and not k.startswith('#') and not os.environ.get(k):
+                os.environ[k] = v
+    os.environ.setdefault('NPM_CONFIG_CACHE', '/var/tmp/buildbar/npm-cache')
+
+
+_umgebung_laden()
+HUB = os.environ.get('OIL_HUB_URL', 'https://oi-labor-hub.friedemann-schuetz.eu').rstrip('/')
+TOKEN = os.environ.get('OIL_HUB_TOKEN', '')
+APPS = os.path.join(os.path.expanduser('~'), 'apps')
+PLATZ_MB = 800  # so viel soll im Home frei sein, bevor Pakete installiert werden
+
+
+def hub(methode, pfad, body=None, timeout=120):
+    h = {'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/json'}
+    daten = None
+    if body is not None:
+        daten = json.dumps(body).encode()
+        h['Content-Type'] = 'application/json'
+    req = urllib.request.Request(HUB + pfad, data=daten, method=methode, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode() or '{}')
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or '{}')
+        except Exception:
+            return e.code, {'fehler': f'HTTP {e.code}'}
+    except Exception as e:
+        return 599, {'fehler': f'Bereitstellungsdienst nicht erreichbar ({e}).'}
+
+
+def raus(text, code=1):
+    print(text)
+    sys.exit(code)
+
+
+def ordner_von(name=None):
+    if name:
+        o = os.path.join(APPS, name)
+        if not os.path.isdir(o):
+            raus(f'Den Ordner {o} gibt es nicht. „app liste“ zeigt deine Apps.')
+        return o
+    pfad = os.path.abspath(os.getcwd())
+    while pfad != os.path.dirname(pfad):
+        if os.path.dirname(pfad) == APPS:
+            return pfad
+        pfad = os.path.dirname(pfad)
+    raus('Ich weiß nicht, welche App gemeint ist. Gib den Namen mit („app veroeffentlichen <name>“) '
+         'oder ruf den Befehl im Ordner der App auf (~/apps/<name>).')
+
+
+def meta(ordner):
+    datei = os.path.join(ordner, '.oil-app.json')
+    if os.path.exists(datei):
+        with open(datei) as f:
+            return json.load(f)
+    s, b = hub('GET', '/apps/' + os.path.basename(ordner))
+    if s != 200:
+        raus(b.get('fehler', f'Stand nicht abrufbar (HTTP {s}).'))
+    with open(datei, 'w') as f:
+        json.dump({'name': b['name'], 'adresse': b['adresse']}, f)
+    return b
+
+
+def lauf(cmd, cwd, log=None):
+    if log:
+        with open(log, 'w') as f:
+            return subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT).returncode
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+
+def platz_schaffen(behalten):
+    """Das Home hat bei one.intelligence nur rund 1 GB. Vor dem Installieren node_modules und .next anderer Apps
+    entfernen; beides entsteht jederzeit neu (npm ci, npm run build)."""
+    import shutil
+    if not os.path.isdir(APPS) or shutil.disk_usage(os.path.expanduser('~')).free / 1e6 >= PLATZ_MB:
+        return
+    for d in sorted(os.listdir(APPS)):
+        o = os.path.join(APPS, d)
+        if os.path.abspath(o) == os.path.abspath(behalten):
+            continue
+        for teil in ('node_modules', '.next'):
+            p = os.path.join(o, teil)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+                print(f'Platz geschaffen: {d}/{teil} entfernt (entsteht bei Bedarf neu).', flush=True)
+
+
+OI_N8N = 'https://n8n.oi.destination.one'
+
+
+def vorlage_fuer_oi(ziel):
+    """Die App-Vorlage kommt aus dem OI-Labor: Standard-n8n und Fußzeile auf one.intelligence umstellen.
+    Der Hub setzt beim Bauen keine n8n-Adresse, deshalb zählt der Standard in lib/n8n.ts."""
+    tausch = [('https://oi-labor-n8n.friedemann-schuetz.eu', OI_N8N), ('Gebaut im OI-Labor', 'Gebaut mit buildbar_')]
+    for rel in ('lib/n8n.ts', 'README.md', '.env.local.example', 'components/Fuss.tsx'):
+        p = os.path.join(ziel, rel)
+        if not os.path.exists(p):
+            continue
+        t = open(p, encoding='utf-8').read()
+        t2 = t
+        for alt, neu_ in tausch:
+            t2 = t2.replace(alt, neu_)
+        if t2 != t:
+            open(p, 'w', encoding='utf-8', newline='\n').write(t2)
+
+
+def neu(name, titel=''):
+    s, b = hub('POST', '/apps', {'name': name, 'titel': titel})
+    if s not in (200, 201):
+        raus('FEHLER: ' + b.get('fehler', f'HTTP {s}') + (('\n' + b['details']) if b.get('details') else ''))
+    ziel = os.path.join(APPS, b['name'])
+    os.makedirs(APPS, exist_ok=True)
+    r = lauf(['git', 'clone', '-q', b['git'], ziel], APPS)
+    if r.returncode != 0:
+        raus('App angelegt, aber das Holen ging nicht: ' + re.sub(r'//[^@/]+@', '//', r.stderr)[-300:])
+    with open(os.path.join(ziel, '.oil-app.json'), 'w') as f:
+        json.dump({'name': b['name'], 'adresse': b['adresse']}, f)
+    vorlage_fuer_oi(ziel)
+    print(f'App angelegt: {b["name"]}\nAdresse: {b["adresse"]}\nOrdner: {ziel}\nInstalliere die Pakete (1 bis 2 Minuten) ...', flush=True)
+    platz_schaffen(ziel)
+    if lauf(['npm', 'ci', '--no-audit', '--no-fund'], ziel, '/tmp/npm-ci-' + b['name'] + '.log') != 0:
+        print('Hinweis: npm ci meldete einen Fehler, Protokoll in /tmp/npm-ci-' + b['name'] + '.log')
+    print('Fertig. ' + b.get('hinweis', ''))
+
+
+def liste():
+    s, b = hub('GET', '/apps')
+    if s != 200:
+        raus(b.get('fehler', f'HTTP {s}'))
+    if not b['apps']:
+        print(f'Noch keine Apps. Neue App: app neu <name> (höchstens {b["max"]}).')
+    for a in b['apps']:
+        lb = a.get('letzter_build') or {}
+        print(f'{a["name"]:24} {a["adresse"]}  Laufzeit: {a.get("laufzeit")}  letzter Build: {lb.get("status", "-")}')
+
+
+def status(name=None):
+    o = ordner_von(name) if not name else os.path.join(APPS, name)
+    s, b = hub('GET', '/apps/' + os.path.basename(o))
+    if s != 200:
+        raus(b.get('fehler', f'HTTP {s}'))
+    lb = b.get('letzter_build') or {}
+    print(f'{b["name"]}: {b["adresse"]}\nLaufzeit: {b.get("laufzeit")}\nLetzter Build: {lb.get("status", "-")} ({lb.get("beginn", "")} bis {lb.get("ende", "")})')
+
+
+def offen_vor_abschluss(o):
+    """Was von den Pflichtschritten vor dem Abschluss noch nicht im Ordner der App zu sehen ist."""
+    fehlt = []
+    dateien = glob.glob(os.path.join(o, 'workflows', '*.json'))
+    if not any('n8n-nodes-base.stickyNote' in open(p, encoding='utf-8', errors='ignore').read() for p in dateien):
+        fehlt.append('Notizen im Workflow (Skill n8n-dokumentation, danach Workflow-Datei neu sichern)')
+    if not os.path.exists(os.path.join(o, 'pruefbericht.md')):
+        fehlt.append('Prüfbericht (Skill pruefbericht)')
+    return fehlt
+
+
+def veroeffentlichen(name=None, nachricht='Aktualisierung'):
+    o = ordner_von(name)
+    m = meta(o)
+    adresse = m['adresse']
+    print('1/4 Prüfe den Build (npm run build) ...', flush=True)
+    if not os.path.isdir(os.path.join(o, 'node_modules')):
+        platz_schaffen(o)
+        lauf(['npm', 'ci', '--no-audit', '--no-fund'], o, '/tmp/npm-ci.log')
+    if lauf(['npm', 'run', 'build'], o, '/tmp/build.log') != 0:
+        with open('/tmp/build.log') as f:
+            raus('BUILD FEHLGESCHLAGEN. Die letzten Zeilen:\n' + ''.join(f.readlines()[-40:]))
+    marke = f'{int(time.time())}-{random.randint(1000, 9999)}'
+    os.makedirs(os.path.join(o, 'public'), exist_ok=True)
+    with open(os.path.join(o, 'public', 'version.txt'), 'w') as f:
+        f.write(marke + '\n')
+    lauf(['git', 'add', '-A'], o)
+    lauf(['git', 'commit', '-q', '-m', nachricht], o)
+    print('2/4 Übertrage den Stand nach Gitea ...', flush=True)
+    r = lauf(['git', 'push', '-q', 'origin', 'HEAD:main'], o)
+    if r.returncode != 0:
+        raus('PUSH FEHLGESCHLAGEN: ' + re.sub(r'//[^@/]+@', '//', r.stderr)[-400:])
+    print('3/4 Coolify baut die App neu (meist 2 bis 5 Minuten) ...', flush=True)
+    angestossen = False
+    for i in range(72):
+        time.sleep(10)
+        try:
+            with urllib.request.urlopen(adresse + '/version.txt?t=' + str(time.time()), timeout=8) as r:
+                ist = r.read().decode().strip()
+        except Exception:
+            ist = ''
+        if ist == marke:
+            print(f'4/4 LIVE nach {(i + 1) * 10} Sekunden: {adresse}')
+            fehlt = offen_vor_abschluss(o)
+            if fehlt:
+                print('Hinweis: Vor dem Abschluss fehlt noch: ' + '; '.join(fehlt) + '. '
+                      'Alle vier Pflichtschritte (n8n-testdaten, n8n-dokumentation, n8n-security-audit, pruefbericht) gehören dazu.')
+            return
+        if i == 23 and not angestossen:
+            s, _ = hub('POST', f'/apps/{os.path.basename(o)}/deploy')
+            angestossen = s == 200
+            print('    Noch nicht live, ich stoße den Build zusätzlich von Hand an ...', flush=True)
+    raus(f'Nach 12 Minuten noch nicht live. „app status“ zeigt den Stand des Builds. Adresse: {adresse}', 2)
+
+
+if __name__ == '__main__':
+    a = sys.argv[1:]
+    if not a or a[0] in ('hilfe', '-h', '--help'):
+        raus(__doc__, 0)
+    if not TOKEN:
+        raus('Der Zugang zum Veröffentlichen fehlt (HUB_TOKEN in /home/user/schluessel.txt). „buildbar-status“ zeigt, was zu tun ist.')
+    befehl = a[0]
+    if befehl == 'neu' and len(a) >= 2:
+        neu(a[1], ' '.join(a[2:]))
+    elif befehl == 'liste':
+        liste()
+    elif befehl == 'status':
+        status(a[1] if len(a) > 1 else None)
+    elif befehl == 'veroeffentlichen':
+        rest = a[1:]
+        name = rest[0] if rest and os.path.isdir(os.path.join(APPS, rest[0])) else None
+        if name:
+            rest = rest[1:]
+        veroeffentlichen(name, ' '.join(rest) or 'Aktualisierung')
+    else:
+        raus(__doc__)

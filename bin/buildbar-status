@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# buildbar-status: zeigt dem Assistenten beim ersten Kontakt, was eingerichtet ist und was fehlt.
+# Gibt nie Schlüssel aus, nur ob sie da sind und ob sie funktionieren. Beendet sich immer mit 0.
+. /opt/buildbar/schluessel-laden.sh
+N8N="${N8N_API_URL:-https://n8n.oi.destination.one}"
+HUB="${OIL_HUB_URL:-https://oi-labor-hub.friedemann-schuetz.eu}"
+DATEI="$HOME/schluessel.txt"
+fehlt=()
+
+echo "buildbar-Arbeitsplatz"
+echo "Werkzeuge: node $(node --version 2>/dev/null || echo fehlt), n8n-mcp $(command -v n8n-mcp >/dev/null && echo da || echo fehlt), chromium $([ -x /usr/bin/chromium ] && echo da || echo fehlt), seite-pruefen $([ -f /opt/buildbar/seite-pruefen.js ] && echo da || echo fehlt)"
+echo "Speicher im Home: $(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4 " frei von " $2}')"
+
+if [ -n "${KUERZEL:-}" ]; then
+  echo "Kürzel: $KUERZEL"
+else
+  echo "Kürzel: fehlt"
+  fehlt+=("KUERZEL")
+fi
+
+if [ -n "${N8N_API_KEY:-}" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "X-N8N-API-KEY: $N8N_API_KEY" "$N8N/api/v1/workflows?limit=1")
+  case "$code" in
+    200) echo "n8n: verbunden ($N8N)" ;;
+    401|403) echo "n8n: Schlüssel wird abgelehnt (HTTP $code). Bitte neuen Schlüssel in n8n anlegen (Einstellungen, API)."; fehlt+=("N8N_API_KEY") ;;
+    *) echo "n8n: nicht erreichbar (HTTP $code)" ;;
+  esac
+else
+  echo "n8n: Schlüssel fehlt"
+  fehlt+=("N8N_API_KEY")
+fi
+
+if [ -n "${OIL_HUB_TOKEN:-}" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "Authorization: Bearer $OIL_HUB_TOKEN" "$HUB/apps")
+  case "$code" in
+    200) echo "Veröffentlichen: verbunden ($HUB)" ;;
+    401|403) echo "Veröffentlichen: Zugang wird abgelehnt (HTTP $code). Bitte die Betreuung fragen."; fehlt+=("HUB_TOKEN") ;;
+    *) echo "Veröffentlichen: Dienst nicht erreichbar (HTTP $code)" ;;
+  esac
+else
+  echo "Veröffentlichen: Zugang fehlt"
+  fehlt+=("HUB_TOKEN")
+fi
+
+for z in CRED_KI:"buildbar KI" CRED_DATAFORSEO:"buildbar DataForSEO" CRED_APIFY:"buildbar Apify"; do
+  k="${z%%:*}"; n="${z#*:}"
+  w="${!k:-}"
+  [ -n "$w" ] && echo "Zugang im n8n-Konto: $n (ID $w)"
+done
+
+if [ ${#fehlt[@]} -gt 0 ]; then
+  echo
+  echo "ES FEHLT: ${fehlt[*]}"
+  echo "Die Person legt dafür die Datei $DATEI an (rechts im Terminal, Reiter Dateien), eine Zeile je Wert:"
+  for k in "${fehlt[@]}"; do
+    case "$k" in
+      KUERZEL) echo "  KUERZEL=<kurzes Kürzel, Kleinbuchstaben, z. B. bhil>" ;;
+      N8N_API_KEY) echo "  N8N_API_KEY=<API-Schlüssel aus n8n: Einstellungen, n8n API, Schlüssel erstellen>" ;;
+      HUB_TOKEN) echo "  HUB_TOKEN=<Zugang zum Veröffentlichen, kommt von der Betreuung>" ;;
+    esac
+  done
+  echo "Danach noch einmal buildbar-status aufrufen."
+else
+  echo
+  echo "ALLES BEREIT."
+fi
+exit 0

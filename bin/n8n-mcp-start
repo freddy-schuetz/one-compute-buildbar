@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# n8n-Verbindung des Assistenten (n8n-mcp über stdio). Die Standardausgabe gehört dem Protokoll,
+# alles andere geht ins Log /tmp/n8n-mcp.log. Aufgerufen von n8n-werkzeug.
+. /opt/buildbar/schluessel-laden.sh
+export N8N_API_URL="${N8N_API_URL:-https://n8n.oi.destination.one}"
+export MCP_MODE=stdio
+export LOG_LEVEL=error
+export DISABLE_CONSOLE_OUTPUT=true
+# Im n8n-Konto der Person liegen auch andere Workflows: Löschen, Zugänge und das Instanz-Audit gibt es nicht.
+export DISABLED_TOOLS="n8n_delete_workflow,n8n_manage_credentials,n8n_audit_instance"
+exec n8n-mcp 2>> /tmp/n8n-mcp.log
