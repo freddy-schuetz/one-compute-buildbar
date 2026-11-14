@@ -4,3 +4,5 @@ README.md
 openwebui
 **/__pycache__
 *.pyc
+# Sicherungen früherer Stände gehören nicht ins Image
+**/*.vor-*

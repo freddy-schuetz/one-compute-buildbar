@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Beschreibung und Zusatz gehören nicht ins Image: Änderungen daran erzeugen keine neue Fassung
+    paths-ignore:
+      - 'README.md'
+      - 'openwebui/**'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions:

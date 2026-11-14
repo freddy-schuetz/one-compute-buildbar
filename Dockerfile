@@ -12,11 +12,14 @@ LABEL org.opencontainers.image.title="one.compute (buildbar_)" \
 
 USER root
 
-# Standardwerte für alle Personen (ohne Geheimnisse); ~/.buildbar/zugang.env kann sie überschreiben
+# Standardwerte für alle Personen (ohne Geheimnisse); ~/.buildbar/zugang.env kann die beiden Adressen überschreiben.
+# N8N_MCP_TELEMETRY_DISABLED: n8n-mcp schickt keine Nutzungsdaten an seinen Hersteller. n8n-mcp-start setzt den Schalter
+# ebenfalls; hier gilt er auch, wenn jemand n8n-mcp direkt aufruft.
 ENV N8N_API_URL=https://n8n.oi.destination.one \
     OIL_HUB_URL=https://oi-labor-hub.friedemann-schuetz.eu \
     NPM_CONFIG_CACHE=/var/tmp/buildbar/npm-cache \
-    BB_WERK=/var/tmp/buildbar
+    BB_WERK=/var/tmp/buildbar \
+    N8N_MCP_TELEMETRY_DISABLED=true
 
 # n8n-mcp (Werkzeuge für n8n, fest auf die geprüfte Version) und der Browser-Baustein für seite-pruefen
 RUN npm install -g --no-audit --no-fund n8n-mcp@2.91.0 \
@@ -29,7 +32,10 @@ COPY bin/ /usr/local/bin/
 COPY lib/ /opt/buildbar/
 RUN chmod 755 /usr/local/bin/app /usr/local/bin/n8n-werkzeug /usr/local/bin/n8n-mcp-start \
               /usr/local/bin/seite-pruefen /usr/local/bin/buildbar-status /usr/local/bin/buildbar-merken \
- && chmod 644 /opt/buildbar/seite-pruefen.js /opt/buildbar/schluessel-laden.sh \
+              /usr/local/bin/workflow-pruefen /usr/local/bin/datei-ansehen /usr/local/bin/seite-ansehen \
+ && chmod 644 /opt/buildbar/seite-pruefen.js /opt/buildbar/seite-ansehen.js /opt/buildbar/schluessel-laden.sh \
+ && python3 /usr/local/bin/workflow-pruefen hilfe >/dev/null \
+ && python3 /usr/local/bin/datei-ansehen hilfe >/dev/null \
  && node -e "require('/opt/buildbar/node_modules/puppeteer-core/package.json')" \
  && command -v n8n-mcp >/dev/null \
  && rm -rf /usr/local/bin/__pycache__

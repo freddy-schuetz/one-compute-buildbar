@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# seite-ansehen: eine fremde, öffentliche Webseite einmal im Browser ansehen (Website des Hauses oder eine Quelle).
+# Liefert Bild, Hausfarben mit geprüftem Kontrast, Logo-Kandidaten, Navigation, Überschriften und Text.
+# Aufruf: seite-ansehen <adresse> [--name <kurzname>] [--nur-text]. Hilfe: seite-ansehen hilfe
+#
+# Sperre: Chromium läuft nie neben einem Bau oder neben seite-pruefen, denn das Terminal hat nur 2 GB Arbeitsspeicher.
+# Vor dem Start wartet der Befehl deshalb höchstens 100 Sekunden auf /tmp/buildbar-bau.lock, dieselbe Sperre wie app und
+# seite-pruefen (flock), und bricht sonst ab: So bleibt er unter den 300 Sekunden, die ein Befehl laufen darf. Vorher
+# prüft er ohne Browser Aufruf und Adresse: Eine Ablehnung kommt sofort, auch während eines Baus. Gehalten wird die
+# Sperre, solange node läuft (node erbt die offene Sperrdatei, fd 9). BUILDBAR_SPERRE_GEHALTEN=1 heißt: Der Aufrufer
+# hält die Sperre schon. Zusätzlich sieht node in der Prozessliste nach: Läuft seite-pruefen oder ein Build an der
+# Sperre vorbei (oder fehlt das Programm flock), wartet es bis zu 60 Sekunden und startet den Browser sonst nicht.
+# SEITE_ANSEHEN_BEGINN (Millisekunden) sagt node, wann der Aufruf begann: Die Wartezeit geht von seiner Zeit ab.
+# Vor der Ausgabe von node schreibt der Starter nichts, denn ihre erste Zeile kennzeichnet den fremden Inhalt.
+SPERRE=/tmp/buildbar-bau.lock
+JS=/opt/buildbar/seite-ansehen.js
+export SEITE_ANSEHEN_MODUL=/opt/buildbar/node_modules/puppeteer-core
+beginn=$(date +%s%3N 2>/dev/null) && export SEITE_ANSEHEN_BEGINN="$beginn"
+
+case "${1:-}" in
+  '' | hilfe | -h | --help) exec node "$JS" "$@" ;; # die Hilfe startet keinen Browser und wartet nicht
+esac
+
+if [ "${BUILDBAR_SPERRE_GEHALTEN:-}" != 1 ] && command -v flock >/dev/null 2>&1; then
+  node "$JS" --nur-vorab "$@" || exit $?
+  # Nur eine normale Datei, keine Verknüpfung (wie seite-pruefen). Nur lesend öffnen, wie app: flock braucht kein
+  # Schreibrecht, und eine fremde Sperrdatei bleibt nutzbar.
+  [ -e "$SPERRE" ] || : >>"$SPERRE" 2>/dev/null
+  if [ -f "$SPERRE" ] && [ ! -L "$SPERRE" ] && { exec 9<"$SPERRE"; } 2>/dev/null; then
+    if ! flock -n 9; then
+      ab=$(date +%s%3N 2>/dev/null)
+      if ! flock -w 100 9; then
+        echo "NICHT ANGESEHEN: Gerade läuft ein Bau (app), seite-pruefen oder ein anderes seite-ansehen, und für beides zugleich reicht der Speicher nicht. Ich habe 100 Sekunden gewartet. Rufe seite-ansehen auf, wenn das fertig ist."
+        exit 1
+      fi
+      export SEITE_ANSEHEN_GEWARTET_AB="$ab"
+    fi
+  fi
+fi
+
+exec node "$JS" "$@"

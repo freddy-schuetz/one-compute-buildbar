@@ -1,0 +1,3461 @@
+#!/usr/bin/env python3
+"""workflow-pruefen: prüft einen n8n-Workflow auf STILLE Fehler (für buildbar_ im Chat von one.intelligence). Gemeint ist,
+was n8n ohne Meldung durchlässt und was später zu falschen Ergebnissen, offenen Türen oder Kosten führt. Der Befehl liest
+nur und ändert nichts. Ruf ihn nach jeder Bau-Etappe und vor dem Abschluss auf.
+
+  workflow-pruefen <workflow-id>      holt den Workflow über n8n-werkzeug (n8n_get_workflow) und prüft ihn
+  workflow-pruefen --datei <pfad>     prüft eine Workflow-Datei (JSON), zum Beispiel workflows/<kurzname>.json
+  workflow-pruefen hilfe              diese Hilfe mit der Liste der Prüfungen
+
+Zwei Stufen: FEHLER behebst du, bevor du weiterbaust. HINWEISE klärst du spätestens vor dem Abschluss.
+Rückgabewert: 0, sobald geprüft wurde (auch mit Befunden), 2 bei falschem Aufruf, 1 wenn der Workflow nicht zu holen war.
+Parameterwerte, die wie Schlüssel aussehen, gibt der Befehl nie aus.
+"""
+import functools
+import json
+import os
+import re
+import sys
+import time
+
+PRUEFUNGEN = """Geprüft wird:
+  FEHLER   Name ohne „buildbar: “ · Workflow mit Webhook nicht aktiv · gespeicherter Stand nicht der aktive · als ALT
+           abgelegter Workflow noch aktiv
+           offene Weiterleitung: Adresse, Pfad, Actor, Modell oder die ganze Anfrage eines bezahlten Dienstes kommt
+           aus der Eingabe · HTTP Request oder RSS-Abruf auf eine Adresse aus der Eingabe · Zugangsdaten im Klartext,
+           auch in Notizen, abgeschalteten Knoten und festgehaltenen Testdaten (pinData)
+           Webhook: Pfad ohne Kürzel, „Respond to Webhook“ unbenutzt oder nicht erreichbar, ein Zweig endet ohne
+           Antwort · Ausdruck {{ }} ohne „=“ am Anfang, $env · Set-Knoten im alten Format (liefert still {})
+           Webhook-Daten ohne .body · Feld, das der Schritt davor nicht liefert · Verweis $('…') auf einen Knoten,
+           den es nicht gibt · Baustein ohne mode "each" oder mit falscher source · IF mit beiden Ausgängen am
+           selben Ziel · Switch-Verbindung an einem Ausgang, den es nicht gibt · Code-Knoten in Python oder mit
+           fetch, $helpers.httpRequest, new URL(, $env, require(, {{ }} · KI: Sprachmodell ohne Zugang, Kette ohne
+           Sprachmodell, Modell über „main“ verbunden, Parser und hasOutputParser passen nicht zusammen
+           Knoten ohne Zugang (Google Sheets, Mail, HTTP Request mit Anmeldung und andere) · gleicher Name bei HTTP,
+           Code, KI oder Baustein · Prüfung unvollständig (dann prüfst du von Hand)
+  HINWEIS  Herkunft nicht prüfbar: Host einer Adresse, Pfad, Actor, Modell oder Anfrage eines bezahlten Dienstes
+           steht nicht fest, und woher er kommt, lässt sich nicht verfolgen · bezahlter Baustein oder KI hinter
+           öffentlichem Webhook ohne Tageszähler · Webhook ohne CORS, mit responseMode "onReceived" oder "lastNode",
+           Test-Webhook · IF oder Switch mit leerem Ausgang oder allen Zielen am ersten Ausgang (fehlendes branch
+           oder case) · Daten holen ohne alwaysOutputData · Tabelle lesen ohne returnAll (höchstens 50 Zeilen)
+           Prompt verlangt Rechnen · Knoten ohne Vorgänger · keine Notiz · doppelte Namen, Standardnamen
+Nicht prüfbar ist, ob das Ergebnis inhaltlich stimmt. Das zeigt nur der Test mit einem echten Beispiel."""
+
+# Mit WORKFLOW_PRUEFEN_WERKZEUG lässt sich zum Testen ein anderer Befehl einsetzen (wie SEITE_PRUEFEN_MODUL bei seite-pruefen)
+WERKZEUG = '/usr/local/bin/n8n-werkzeug'
+PRAEFIX = 'buildbar: '
+GRENZE = 6000       # so lang darf die Ausgabe höchstens werden: Sie landet im Gedächtnis des Assistenten
+ID_OK = re.compile(r'^[A-Za-z0-9]{8,40}$')
+KUERZEL_OK = re.compile(r'^[a-z0-9]{2,20}$')
+TIEFE = 60          # so viele Schritte weit verfolgt der Befehl, woher ein Wert kommt
+BUDGET = 30000      # so viele Auflösungen je Workflow; was danach offen bleibt, gilt als „nicht prüfbar“
+FRIST = 60          # so viele Sekunden darf die Herkunftssuche höchstens dauern (ein Befehl darf hier 300 Sekunden laufen)
+
+# Bausteine der Betreuung, aus der Tabelle „Dein Werkzeugkasten“ in der Anleitung. Ändert sich dort eine ID, auch hier.
+BAUSTEINE = {
+    'TACtAviT5ZPE2JEB': 'Betrieb finden (Google)',
+    'fb4OmOq7ek79vscM': 'Öffnungszeiten Tripadvisor',
+    'DaLxjxtsCpXj6BPn': 'Öffnungszeiten OpenStreetMap',
+    'QVCkqLjQwAjcD4zy': 'Öffnungszeiten Website',
+    'mqA6wGK9Snf3QHou': 'Webseite lesen',
+    'agJOdigKkevOHIwg': 'DataForSEO',
+    'ufmC5ukrLWDPzu3U': 'Apify',
+}
+BEZAHLT = {'agJOdigKkevOHIwg', 'ufmC5ukrLWDPzu3U', 'TACtAviT5ZPE2JEB', 'fb4OmOq7ek79vscM'}
+KURZ = {'TACtAviT5ZPE2JEB': 'Google', 'fb4OmOq7ek79vscM': 'Tripadvisor'}
+GETEILTES_LIMIT = {'agJOdigKkevOHIwg', 'ufmC5ukrLWDPzu3U'}
+# Felder, mit denen ein Aufrufer den bezahlten Dienst steuert: erst die Pfad-artigen, dann die ganze Anfrage
+STEUERFELDER = {'agJOdigKkevOHIwg': (('pfad',), ('anfrage',)), 'ufmC5ukrLWDPzu3U': (('actor',), ('eingabe',))}
+BEZAHLTE_ADRESSEN = re.compile(r'dataforseo\.com|apify\.com|openai\.com|anthropic\.com|generativelanguage\.googleapis\.com|'
+                               r'maps\.googleapis\.com|places\.googleapis\.com|mistral\.ai|openrouter\.ai|elevenlabs\.io|'
+                               r'perplexity\.ai', re.I)
+
+# Woran zu sehen ist, dass ein Schritt eine Adresse prüft: Er nennt interne Adressen oder lässt nur einen festen Host zu
+INTERNE_ADRESSE = re.compile(r'localhost|127\\?\.|169\\?\.254|192\\?\.168')
+FESTER_HOST = re.compile(r'''\^https\??:\\?/\\?/[a-z0-9-]+(?:\\?\.[a-z0-9-]+)+\\?/'''
+                         r'''|startsWith\(\s*['"`]https?://[a-z0-9.-]+/''', re.I)
+
+EINGANG = ('webhook', 'formtrigger', 'chattrigger')
+WEBHOOK_FELDER = {'body', 'query', 'params', 'headers', 'webhookUrl', 'executionMode'}
+# Knoten, die ihre Einträge unverändert weitergeben (Merge außer „SQL Query“, siehe Workflow.reicht_durch)
+DURCHREICHER = {'if', 'switch', 'filter', 'wait', 'noop', 'limit', 'sort', 'removeduplicates', 'splitinbatches',
+                'respondtowebhook', 'executiondata', 'merge', 'comparedatasets'}
+# Knoten, deren Ausgabe nicht aus ihrer Eingabe stammt: Antwort eines Dienstes, Auslöser
+QUELLEN = {'httprequest', 'scheduletrigger', 'manualtrigger', 'cron', 'interval', 'start', 'rssfeedread', 'emailreadimap',
+           'n8n', 'executeworkflowtrigger'}
+DATUM_FELD = {'getCurrentDate': 'currentDate', 'addToDate': 'newDate', 'subtractFromDate': 'newDate',
+              'formatDate': 'formattedDate', 'roundDate': 'roundedDate', 'getTimeBetweenDates': 'timeDifference',
+              'extractDate': 'datePart'}
+# Felder ohne Ausdrucksmodus (noDataExpression), in denen der Knoten {{ }} selbst einsetzt: Dort gehört kein „=“ davor
+SELBST_AUFGELOEST = {'html': ('html',), 'form': ('html',), 'formtrigger': ('html',), 'wait': ('html',), 'merge': ('query',),
+                     'postgres': ('query',), 'mysql': ('query',), 'microsoftsql': ('query',), 'oracledatabase': ('query',),
+                     'questdb': ('query',), 'snowflake': ('query',), 'timescaledb': ('query',), 'cratedb': ('query',),
+                     'azurecosmosdb': ('query',), 'googlebigquery': ('sqlQuery',)}
+KETTEN = {'chainllm', 'agent', 'chainsummarization', 'chainretrievalqa', 'informationextractor', 'textclassifier',
+          'sentimentanalysis'}
+KI_DIREKT = {'openai', 'anthropic', 'googlegemini', 'mistralai', 'perplexity'}
+# Knoten, die ohne Zugang (credentials) nicht laufen, auch als Auslöser (…Trigger) und als Werkzeug einer KI (…Tool).
+# Die Prüfung von n8n meldet ein fehlendes Credential nicht. Sprachmodelle prüft ki().
+ZUGANG_NOETIG = {'googlesheets', 'gmail', 'googledrive', 'googlecalendar', 'googledocs', 'googletranslate', 'emailsend',
+                 'emailreadimap', 'microsoftoutlook', 'microsoftexcel', 'microsoftteams', 'slack', 'telegram', 'whatsapp',
+                 'notion', 'airtable', 'baserow', 'nocodb', 'supabase', 'postgres', 'mysql', 'wordpress', 'facebookgraphapi',
+                 'linkedin', 'deepl', 'openweathermap', 'sendgrid', 'mailjet', 'sendinblue'}
+MODELL = re.compile(r'lm(chat)?[a-z]')
+UNTERKNOTEN = re.compile(r'(lm(chat)?[a-z]|outputparser|memory|embeddings|textsplitter)')
+LESEN = {'datatable': {'get'}, 'googlesheets': {'read'}}
+LESEN_ALLGEMEIN = {'getall', 'getmany', 'search', 'select'}
+ARBEITSKNOTEN = {'code', 'httprequest', 'set', 'if', 'switch', 'filter', 'executeworkflow', 'chainllm', 'agent', 'datatable'}
+STANDARDNAMEN = {
+    'http request', 'code', 'code in javascript', 'code in python', 'edit fields', 'set', 'if', 'switch', 'merge', 'filter',
+    'execute workflow', 'execute sub-workflow', 'call n8n workflow', 'basic llm chain', 'ai agent', 'data table', 'wait',
+    'loop over items', 'split out', 'aggregate', 'summarize', 'sort', 'limit', 'remove duplicates', 'date & time', 'html',
+    'markdown', 'webhook', 'respond to webhook', 'openai chat model', 'one.intelligence chat model',
+    'structured output parser', 'no operation, do nothing', 'function', 'item lists', 'compare datasets', 'insert row',
+    'get row(s)', 'update row(s)', 'upsert row(s)', 'if row exists', 'if row does not exist', 'google sheets', 'send email',
+    'schedule trigger', 'on form submission', 'information extractor', 'text classifier', 'summarization chain',
+    'convert to file', 'extract from file', 'stop and error',
+}
+
+N8N_AUSDRUCK = re.compile(r'\$(?:json|input|node|now|today|workflow|execution|vars|item|binary|prevNode|runIndex|itemIndex|'
+                          r'parameter|env|jmespath|fromAI)\b|\$\(')
+ENV = re.compile(r'\$(?<![\w$]\$)env\b')
+_SCHL = r'''(?:\s*\??\.\s*(?!\d)[\w$]+|\s*\[\s*(?:'[^']*'|"[^"]*")\s*\])'''
+_ZUGRIFF = r'''(?:item|first\s*\(\s*\)|last\s*\(\s*\)|all\s*\(\s*\)\s*\[\s*\d+\s*\]|itemMatching\s*\(\s*[\w$.]*\s*\))'''
+# Bezug auf Daten: $json.a, $input.first().json.a, $('Knoten').item.json.a, $node["Knoten"].json.a, $items('Knoten')[0].json.a
+BEZUG = re.compile(
+    r'''\$(?<![\w$]\$)(?:json\b|input\s*\.\s*''' + _ZUGRIFF + r'''\s*\.\s*json\b'''
+    r'''|\(\s*(?P<q>['"`])(?P<n1>(?:\\.|(?!(?P=q)).)+)(?P=q)\s*\)\s*\.\s*''' + _ZUGRIFF + r'''\s*\.\s*json\b'''
+    r'''|node\s*\[\s*(?P<r>['"])(?P<n2>(?:\\.|(?!(?P=r)).)+)(?P=r)\s*\]\s*\.\s*json\b'''
+    r'''|node\s*\.\s*(?P<n3>(?!\d)\w[\w$]*)\s*\.\s*json\b'''
+    r'''|items\s*\(\s*(?P<s>['"`])(?P<n4>(?:\\.|(?!(?P=s)).)+)(?P=s)\s*\)\s*\[\s*\d+\s*\]\s*\.\s*json\b)(?P<pfad>''' + _SCHL + r'''*)''')
+# Der ganze Eintrag ohne .json dahinter: $input.all(), $input.item, $('Knoten').first(), items
+GANZE_EINGABE = re.compile(r'''\$(?<![\w$]\$)(?:input|\(\s*(?P<q>['"`])(?P<n>(?:\\.|(?!(?P=q)).)+)(?P=q)\s*\))\s*\.\s*'''
+                           r'''(?:all\s*\(\s*\)|first\s*\(\s*\)|last\s*\(\s*\)|item\b)|(?<![\w$.])items\b''')
+# Im Code-Knoten auch: item.json.a, items[0].json.a
+LOSE = re.compile(r'''(?<![\w$.])(?!\d)\w[\w$]*(?:\s*\[\s*\d+\s*\])?\s*\.\s*json\b(?P<pfad>''' + _SCHL + r'''*)''')
+ALIASZUGRIFF = re.compile(r'''((?!\d)[\w$]+)((?:''' + _SCHL + r''')*)''')
+VERWEIS = re.compile(r'''\$(?<![\w$]\$)(?:(?:items)?\(\s*(?P<q>['"`])(?P<a>(?:\\.|(?!(?P=q)).)+)(?P=q)\s*[,)]'''
+                     r'''|node\s*\[\s*(?P<r>['"])(?P<b>(?:\\.|(?!(?P=r)).)+)(?P=r)\s*\])''')
+_TEIL = re.compile(r'''\??\.\s*((?!\d)[\w$]+)|\[\s*(?:'([^']*)'|"([^"]*)")\s*\]''')
+TEXTWERT = re.compile(r'''\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")\s*''')
+VEREINBARUNG = re.compile(r'(?<![\w$])(?:const|let|var)\s+(?:(?P<eins>(?!\d)[\w$]+)|\{(?P<viele>[^{}]*)\}|'
+                          r'\[(?P<reihe>[^\[\]]*)\])\s*=(?![=>])')
+NAMENSZUWEISUNG = re.compile(r'(?<![\w$.])((?!\d)[\w$]+)\s*(\+=|=(?![=>]))')
+SCHREIBEN = re.compile(r'''(?<![\w$.])((?!\d)[\w$]+)((?:\s*\??\.\s*(?!\d)[\w$]+|\s*\[\s*(?:'[^']*'|"[^"]*")\s*\])+)'''
+                       r'''\s*(\+?)=(?![=>])''')
+ZUWEISUNG = re.compile(r'\s*(?:\*\*|<<|>>>?|\?\?|&&|\|\||[-+*/%&|^])?=(?![=>])|\s*(?:\+\+|--)')
+_LOESCHEN = re.compile(r'(?<![\w$.])delete\s+$')
+SCHLEIFE = re.compile(r'\.\s*(?P<art>(?!\d)[\w$]+)\s*\(\s*(?:async\s+)?'
+                      r'(?:function\s*[\w$]*\s*)?(?:\(\s*(?P<liste>[^()]*?)\s*\)|(?P<eins>(?!\d)[\w$]+))\s*(?:=>|\{)')
+ELEMENTWEISE = {'map', 'forEach', 'filter', 'find', 'findLast', 'findIndex', 'findLastIndex', 'flatMap', 'some', 'every'}
+_PFEIL = re.compile(r'\s*(?:async\s+)?(?:function\s*[\w$]*\s*)?(?:\(\s*([^()]*?)\s*\)|((?!\d)[\w$]+))\s*(?:=>|\{)')
+FUER = re.compile(r'(?<![\w$.])for\s*\(\s*(?:const|let|var)\s+(?:(?P<eins>(?!\d)[\w$]+)|\{(?P<viele>[^{}]*)\}|'
+                  r'\[(?P<reihe>[^\[\]]*)\])\s+of\s')
+# Eigene Funktion im Code-Knoten: function f(a, b) { … } oder const f = (a, b) => …
+FUNKTION = re.compile(r'(?<![\w$.])(?:function\s+(?P<f1>(?!\d)[\w$]+)\s*\((?P<p1>[^()]*)\)|(?:const|let|var)\s+'
+                      r'(?P<f2>(?!\d)[\w$]+)\s*=\s*(?:async\s+)?(?:function\s*[\w$]*\s*\((?P<p2>[^()]*)\)|\((?P<p3>[^()]*)\)\s*=>|'
+                      r'(?P<p4>(?!\d)[\w$]+)\s*=>))')
+DURCH = re.compile(r'(?<![\w$.])return\s+(?:\$input\s*\.\s*(?:all\s*\(\s*\)|first\s*\(\s*\)|last\s*\(\s*\)|item)|items|\$json|item'
+                   r'|\[\s*\$input\s*\.\s*item\s*\]|\[?\s*\{\s*json\s*:\s*\$json\s*\}\s*\]?)(?![\w$])\s*(?:;|\}|$)', re.M)
+DYNAMISCH = re.compile(r'''[\w$\])]\s*\[\s*(?!['"`\d\s])[^\]\n]*\]\s*=(?![=>])|(?<![\w$.])(?:Object\s*\.\s*(?:fromEntries|entries)|'''
+                       r'''JSON\s*\.\s*parse|structuredClone)\s*\(|(?<![\w$.])for\s*\([^)\n]*\sin\s''')
+MODELL_SCHLUESSEL = r'(?:model|model_name|modell|modelId|modelName|engine)'
+
+RECHEN_VERB = re.compile(r'\b(?:berechne|errechne|rechne|summiere|addiere|subtrahiere|multipliziere|dividiere|zähle|zaehle|zähl|'
+                         r'zaehl|calculate|compute|sum up|add up|count(?!\s+on\b))\b', re.I)
+RECHEN_NOMEN = re.compile(r'\b(?:durchschnitt(?:e?s|e|s\w+)?|mittelwert\w*|prozent\w*|summen?|anzahl|anteile?n?|anteils|'
+                          r'gesamt(?:zahl|summe|dauer|preis|kosten|anzahl|betrag|stunden|minuten|wert(?!ung))\w*|percent\w*|average)\b',
+                          re.I)
+RECHEN_FRAGE = re.compile(r'\b(?P<a>wie\s+viele?|how\s+many|wie\s+oft)\b|\bwie\s+lange\b[^.?!\n]*\b(?P<b>insgesamt)\b|'
+                          r'\b(?P<c>insgesamt)\b[^.?!\n]*\(in\s+(?:stunden|minuten|tagen|euro)\b', re.I)
+GEGEBEN_DANACH = re.compile(r'[^{}.!?]{0,40}?(?:[:=]|\b(?:ist|sind|war|liegt bei|lag bei|beträgt|betraegt)\b)\s*'
+                            r'(?:\{\{\}\}|\d)', re.I)
+GEGEBEN_DAVOR = re.compile(r'(?:\{\{\}\}|\d)\s*$')
+VERNEINT = re.compile(r'\b(?:nicht|nichts|nie|niemals|kein\w*|ohne|statt|not|never)\b', re.I)
+
+# Feldnamen von Zugängen, nach Entfernen von Bindestrichen und Unterstrichen: x-rapidapi-key, Ocp-Apim-Subscription-Key, appid
+SCHLUESSEL_ENDE = ('apikey', 'accesskey', 'secretkey', 'privatekey', 'appkey', 'subscriptionkey', 'licensekey', 'authkey',
+                   'clientkey', 'masterkey', 'token', 'secret', 'password', 'passwort', 'passwd', 'credential', 'credentials',
+                   'authorization', 'appid', 'apisecret')
+# Namen, die auf „token“ oder „key“ enden und doch kein Zugang sind: Blättermarken, Kennungen einzelner Anfragen
+KEIN_ZUGANG = re.compile(r'pagetoken|nexttoken|continuation|cursor|synctoken|idempot|postman|csrf|^secweb')
+SCHLUESSELMUSTER = [
+    ('ein Bearer-Token', re.compile(r'\bBearer\s+[A-Za-z0-9._~+/=-]{16,}')),
+    ('ein Basic-Zugang', re.compile(r'\bBasic\s+[A-Za-z0-9+/]{12,}={0,2}')),
+    ('ein Zugangszeichen (JWT)', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}')),
+    ('ein API-Schlüssel', re.compile(r'\b(?:sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{30,}|'
+                                    r'github_pat_[A-Za-z0-9_]{30,}|AIza[0-9A-Za-z_-]{30,}|apify_api_[A-Za-z0-9]{20,}|'
+                                    r'AKIA[0-9A-Z]{16}|xkeysib-[a-f0-9]{20,})')),
+    ('ein privater Schlüssel', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
+    ('Zugangsdaten in einer Adresse', re.compile(r'https?://[^\s/:@{}]+:[^\s/@{}]+@')),
+    # ohne die Angaben einer zeitlich begrenzten, signierten Adresse (X-Amz-Security-Token und Ähnliches)
+    ('ein Schlüssel in einer Adresse', re.compile(r'[?&](?!x-amz-|x-goog-)(?:[\w-]*?(?:api[_-]?key|access[_-]?key|app[_-]?key|subscription[_-]?key|'
+                                                r'secret|token|password|passwort)|key|apikey|appid|app_id|auth)='
+                                                r'(?=[^&\s{}"\']*\d)[^&\s{}"\'=]{8,}', re.I)),
+]
+# Name: Wert im Code oder JSON (apiKey: '…', MY_API_KEY = '…', "password": "…"); ob der Name ein Zugang ist, prüft paarname()
+SCHLUESSELPAAR = re.compile(r'''(?<![\w$])["']?([A-Za-z_$][\w$-]*)["']?\s*[:=]\s*["'`]([^"'`\s{}]{8,})["'`]''')
+PAAR_ENDE = ('apikey', 'accesskey', 'appkey', 'privatekey', 'secretkey', 'subscriptionkey', 'authkey', 'accesstoken', 'authtoken',
+             'token', 'secret', 'password', 'passwort', 'passwd', 'authorization', 'appid')
+PLATZHALTER = re.compile(r'dein|your|xxx|\.\.\.|[<>]|platzhalter|placeholder|example|beispiel|changeme|todo', re.I)
+# Zeile einer Notiz wie „Passwort: …“ oder „- **API-Key:** `…`“ (ein Name, ein Wert, sonst nichts)
+NOTIZZEILE = re.compile(r'''^[\s>*#|-]*`?(?P<n>[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9 _.-]{1,30}?)`?\**\s*[:=]\s*\**\s*[`"']?'''
+                        r'''(?P<w>[^\s`"'*|]{8,})[`"']?\**\s*\|?\s*$''', re.M)
+NOTIZ_ENDE = PAAR_ENDE + ('kennwort', 'pwd')
+LANGE_KETTE = re.compile(r'[A-Za-z0-9+/_-]{40,}={0,2}')
+# Filter auf eine Tagesspalte oder eine Kennung: trifft höchstens eine Zeile
+EINZELSPALTE = re.compile(r'(?:^|_)(?:tag|datum|date|day|heute|id|kennung|uuid|key|schluessel|schlüssel|slug|email|mail|code|'
+                          r'nummer|nr)$', re.I)
+
+GEWICHT_UNKLAR = 4
+
+
+def anf(text):
+    return f'„{text}“'
+
+
+def bloecke(text):
+    """Alle {{ … }} eines Texts als (Anfang, Ende, Inhalt). Wie in n8n endet ein Block beim nächsten }}."""
+    stelle = 0
+    while True:
+        auf = text.find('{{', stelle)
+        zu = text.find('}}', auf + 2) if auf >= 0 else -1
+        if zu < 0:
+            return
+        yield auf, zu + 2, text[auf + 2:zu]
+        stelle = zu + 2
+
+
+def liste(namen, grenze=5):
+    """„A“, „B“ und „C“; ab der Grenze mit „und N weitere“."""
+    namen = list(dict.fromkeys(namen))
+    gezeigt = [anf(n) for n in namen[:grenze]]
+    if len(namen) > grenze:
+        return ', '.join(gezeigt) + f' und {len(namen) - grenze} weitere'
+    if len(gezeigt) <= 1:
+        return ''.join(gezeigt)
+    return ', '.join(gezeigt[:-1]) + ' und ' + gezeigt[-1]
+
+
+def kuerzen(text, laenge):
+    text = re.sub(r'\s+', ' ', str(text)).strip()
+    return text if len(text) <= laenge else text[:laenge - 1].rstrip() + '…'
+
+
+def maskieren(text):
+    """Ersetzt alles, was wie ein Schlüssel aussieht. Jede Ausgabe des Befehls läuft hier durch."""
+    for _, muster in SCHLUESSELMUSTER:
+        text = muster.sub('[ausgeblendet]', text)
+    text = re.sub(r'\b[0-9a-fA-F]{32,}\b', '[ausgeblendet]', text)
+
+    def lang(m):
+        s = m.group(0)
+        gemischt = re.search(r'[a-z]', s) and re.search(r'[A-Z]', s) and re.search(r'\d', s)
+        return '[ausgeblendet]' if gemischt else s
+    return LANGE_KETTE.sub(lang, text)
+
+
+def raus(text, code=1):
+    print(maskieren(text))
+    sys.exit(code)
+
+
+def fehlerstelle(fehler):
+    """Zeile im eigenen Code, an der ein unerwarteter Fehler entstand (für die Meldung an die Betreuung)."""
+    spur = fehler.__traceback__
+    while spur is not None and spur.tb_next is not None:
+        spur = spur.tb_next
+    return f'Zeile {spur.tb_lineno}' if spur is not None else 'Stelle unbekannt'
+
+
+def kuerzel_laden():
+    """Das Kürzel der Person, wie in app: ~/.buildbar/zugang.env gilt vor der Umgebung, geheim.env füllt nur Lücken.
+    Gelesen wird nur dieser eine Name, nie ein Schlüssel."""
+    wert = os.environ.get('KUERZEL', '')
+    heim = os.path.join(os.path.expanduser('~'), '.buildbar')
+    for datei, vorrang in ((os.path.join(heim, 'zugang.env'), True), (os.path.join(heim, 'geheim.env'), False)):
+        if not os.path.exists(datei):
+            continue
+        try:
+            with open(datei, encoding='utf-8') as f:
+                for zeile in f:
+                    k, trenner, v = zeile.strip().partition('=')
+                    if trenner and k.strip() == 'KUERZEL' and (vorrang or not wert):
+                        wert = v.strip()
+        except OSError:
+            pass
+    wert = wert.strip().lower()
+    return wert if KUERZEL_OK.match(wert) else ''
+
+
+def abgelegt(name):
+    """Ist der Workflow als Fehlversuch abgelegt? Ja bei „ALT“ in Großbuchstaben als eigenem Wort (… ALT, (ALT), ALT 2, ALT2,
+    …_ALT, ALT …) und bei „alt“ in anderer Schreibweise ganz am Ende oder in Klammern (… alt, … Alt 3, … (alt, Stand Mai)).
+    Nein bei Wörtern eines Titels: „Wie alt ist das Hotel“, „Alt-Wien“, „Für Jung und Alt“."""
+    rest = name[len(PRAEFIX):] if name.startswith(PRAEFIX) else name
+    treffer = list(re.finditer(r'(?<![^\W_])ALT(?:\s?\d{1,3})?(?![^\W_])', rest))
+    treffer += list(re.finditer(r'(?<![^\W_])alt(?=[\s)\]]*(?:\d{1,3}[\s)\]]*)?$)', rest, re.I))       # ganz am Ende
+    treffer += list(re.finditer(r'(?<=[(\[])\s*alt(?![\w-])|(?<![\w-])alt(?=\s*[)\]])', rest, re.I))    # in Klammern: (alt, Stand Mai)
+    return any(not re.search(r'(?:(?<![^\W_])(?:und|oder)|[&+/])\s*$', rest[:m.start()], re.I) for m in treffer)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# JavaScript lesen: Kommentare und Texte ausblenden, an Trennzeichen teilen, harmlose Hüllen entfernen
+# ---------------------------------------------------------------------------------------------------------------------
+_AUF = '([{'
+_ZU = ')]}'
+_REGEX_DAVOR = set('(,=:[!&|?{;+-*%<>~^')
+_REGEX_WORT = re.compile(r'(?:return|typeof|case|in|of|do|else|void|delete)\s*$')
+_HUELLE = re.compile(r'(?:String|Number|JSON\s*\.\s*stringify|JSON\s*\.\s*parse|encodeURIComponent|encodeURI|'
+                     r'decodeURIComponent)\s*\(')
+_LOCKER = re.compile(r'(?!\d)[\w$]+\s*\(')
+_METHODEN = (r'(?:trim|trimStart|trimEnd|toLowerCase|toUpperCase|toString|slice|substring|substr|replace|replaceAll|normalize|'
+             r'filter|sort|reverse)')
+# replace und replaceAll sind keine reine Hülle: Was sie einsetzen, kann aus der Eingabe kommen (siehe Workflow.ersetzt)
+_METHODE_HINTEN = re.compile(r'\??\.\s*' + _METHODEN.replace('replace|replaceAll|', '') + r'\s*\($')
+_METHODE_VORN = re.compile(r'\s*\??\.\s*' + _METHODEN + r'\s*\(')
+_ERSETZEN = re.compile(r'\??\.\s*(replace|replaceAll)\s*$')
+_EINFACHER_REGEX = re.compile(r'/((?:[\w \-:;,=@#%&<>"\'!~]|\\[^\w\s])+)/([a-z]*)')
+_FESTWERT = re.compile(r'''\s*(?:'[^']*'|"[^"]*"|`[^`$]*`|-?\d+(?:\.\d+)?|null|undefined|true|false|\{\s*\}|\[\s*\])\s*''')
+_ERSATZ = re.compile(r'''\s*(?:\|\||\?\?)\s*(?:'[^']*'|"[^"]*"|\d+|null|undefined|\{\s*\}|\[\s*\])''')
+_VERGLEICH = re.compile(r'\s*(?:===|!==|==|!=|>=|<=|>(?![>=])|<(?![<=])|&&|\?(?![.?]))')
+_PRUEFT = re.compile(r'\s*\??\.\s*(?:includes|startsWith|endsWith|search|indexOf|lastIndexOf|length|localeCompare)\b')
+_TREFFER = re.compile(r'\s*\??\.\s*(?:match|matchAll)\s*\(')
+_BEDINGUNG = re.compile(r'(?<![\w$.])(?:if|while)\s*$')
+_DAVOR = re.compile(r'(?:===|!==|==|!=|>=|<=|<|(?<!=)>|\.\s*(?:includes|has|test|indexOf|startsWith|endsWith)\s*\(|'
+                    r'[\w$\]]\[|typeof\s|!)\s*$')
+_ZU_KLAMMER = re.compile(r'\s*\)')
+_NAECHSTES = re.compile(r'\s*(\S)')
+_AUF_HUELLE = re.compile(r'(?:String|Number)?\s*\(\s*$')
+_SCHLUESSELWORTE = {'return', 'typeof', 'await', 'new', 'case', 'in', 'of', 'void', 'delete', 'yield', 'else', 'do', 'throw'}
+_AUFRUF = re.compile(r'((?!\d)[\w$]+)\s*\(')
+_ABLAGE = re.compile(r'\$binary(?![\w$])|customData|staticData|\$getWorkflowStaticData')
+_VERKETTUNG = re.compile(r'\??\.\s*(concat|join)\s*$')
+# Namen, die es in JavaScript und im Code-Knoten von n8n ohne eigene Vereinbarung gibt. Jeder andere Name ohne Vereinbarung
+# ist für den Befehl von offener Herkunft (etwa der Parameter einer Funktion, die er nicht zuordnen kann).
+JS_BEKANNT = frozenset('''true false null undefined NaN Infinity this new typeof instanceof in of void delete await async
+    function return if else for while do switch case default break continue throw try catch finally const let var class
+    extends super yield static get set import export from as globalThis arguments
+    String Number Boolean Array Object JSON Math Date RegExp Map Set WeakMap WeakSet Promise Symbol BigInt Error TypeError
+    RangeError SyntaxError Intl Buffer URL URLSearchParams TextEncoder TextDecoder console crypto parseInt parseFloat isNaN
+    isFinite encodeURIComponent encodeURI decodeURIComponent decodeURI escape unescape btoa atob setTimeout clearTimeout
+    setInterval clearInterval structuredClone require module exports process fetch DateTime Duration Interval luxon
+    items item $ $input $json $node $items $item $now $today $workflow $execution $vars $env $itemIndex $runIndex $prevNode
+    $parameter $jmespath $binary $position $mode $nodeVersion $nodeId $webhookId $secrets $response $request $pageCount
+    $getWorkflowStaticData $evaluateExpression $ifEmpty $if $max $min $not $helpers helpers $fromAI $data'''.split())
+
+
+@functools.lru_cache(maxsize=None)
+def js_schichten(code):
+    """Zwei gleich lange Fassungen eines JavaScript-Texts: ohne Kommentare, und zusätzlich ohne die Inhalte von
+    Zeichenketten, Vorlagen und regulären Ausdrücken (durch Leerzeichen ersetzt). So trifft eine Suche nur echten Code."""
+    n = len(code)
+    ohne = list(code)
+    kern = list(code)
+
+    def leeren(von, bis, auch_ohne=False):
+        for j in range(von, min(bis, n)):
+            if code[j] != '\n':
+                kern[j] = ' '
+                if auch_ohne:
+                    ohne[j] = ' '
+
+    def vorlage(j):
+        """Liest den Text einer Vorlage ab Stelle j. Zurück: nächste Stelle, und ob dort ein ${ ... } beginnt."""
+        start = j
+        while j < n:
+            if code[j] == '\\':
+                j += 2
+            elif code[j] == '`':
+                leeren(start, j)
+                return j + 1, False
+            elif code.startswith('${', j):
+                leeren(start, j)
+                return j + 2, True
+            else:
+                j += 1
+        leeren(start, n)
+        return n, False
+
+    i = 0
+    letztes = ''
+    offen = []      # je offenem ${ in einer Vorlage: Tiefe der geschweiften Klammern darin
+    while i < n:
+        c = code[i]
+        if code.startswith('//', i):
+            j = code.find('\n', i)
+            j = n if j < 0 else j
+            leeren(i, j, True)
+            i = j
+            continue
+        if code.startswith('/*', i):
+            j = code.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            leeren(i, j, True)
+            i = j
+            continue
+        if c in '\'"':
+            j = i + 1
+            while j < n and code[j] != c and code[j] != '\n':
+                j += 2 if code[j] == '\\' else 1
+            leeren(i + 1, j)
+            i = min(j + 1, n)
+            letztes = c
+            continue
+        if c == '`':
+            i, auf = vorlage(i + 1)
+            if auf:
+                offen.append(0)
+            letztes = '{' if auf else '`'
+            continue
+        if offen and c == '{':
+            offen[-1] += 1
+        elif offen and c == '}':
+            if offen[-1] == 0:
+                offen.pop()
+                i, auf = vorlage(i + 1)
+                if auf:
+                    offen.append(0)
+                letztes = '{' if auf else '`'
+                continue
+            offen[-1] -= 1
+        if c == '/' and (not letztes or letztes in _REGEX_DAVOR or _REGEX_WORT.search(code[max(0, i - 12):i])):
+            j = i + 1
+            klasse = False
+            while j < n and code[j] != '\n':
+                if code[j] == '\\':
+                    j += 2
+                    continue
+                if code[j] == '[':
+                    klasse = True
+                elif code[j] == ']':
+                    klasse = False
+                elif code[j] == '/' and not klasse:
+                    break
+                j += 1
+            if j < n and code[j] == '/':
+                leeren(i + 1, j)
+                i = j + 1
+                while i < n and code[i].isalpha():
+                    i += 1
+                leeren(j + 1, i)        # die Schalter dahinter (g, i, m …) sind keine Namen
+                letztes = ')'
+                continue
+        if not c.isspace():
+            letztes = c
+        i += 1
+    return ''.join(ohne), ''.join(kern)
+
+
+@functools.lru_cache(maxsize=None)
+def passend(kern, i):
+    """Stelle der schließenden Klammer zur öffnenden an Stelle i, sonst -1."""
+    tiefe = 0
+    for j in range(i, len(kern)):
+        if kern[j] in _AUF:
+            tiefe += 1
+        elif kern[j] in _ZU:
+            tiefe -= 1
+            if tiefe == 0:
+                return j
+    return -1
+
+
+@functools.lru_cache(maxsize=None)
+def oeffnend(kern, j):
+    """Stelle der öffnenden Klammer zur schließenden an Stelle j, sonst -1."""
+    tiefe = 0
+    for i in range(j, -1, -1):
+        if kern[i] in _ZU:
+            tiefe += 1
+        elif kern[i] in _AUF:
+            tiefe -= 1
+            if tiefe == 0:
+                return i
+    return -1
+
+
+@functools.lru_cache(maxsize=None)
+def teile_oben(code, kern, zeichen):
+    """Teilt code an den Stellen von zeichen, die außerhalb von Klammern und Texten stehen."""
+    teile = []
+    tiefe = 0
+    start = 0
+    i = 0
+    n = len(kern)
+    breite = len(zeichen)
+    while i < n:
+        c = kern[i]
+        if c in _AUF:
+            tiefe += 1
+        elif c in _ZU:
+            tiefe -= 1
+        elif tiefe == 0 and kern.startswith(zeichen, i):
+            davor = kern[i - 1] if i else ''
+            danach = kern[i + breite] if i + breite < n else ''
+            if zeichen == '+' and (davor == '+' or danach in ('+', '=')):
+                i += 1
+                continue
+            if zeichen == '&&' and danach == '=':
+                i += 1
+                continue
+            teile.append(code[start:i])
+            start = i + breite
+            i += breite
+            continue
+        i += 1
+    teile.append(code[start:])
+    return tuple(teile)
+
+
+def ende_oben(kern, i, zeichen):
+    """Erste Stelle ab i, an der auf oberster Ebene eines der Zeichen steht oder eine Klammer schließt, die vor i
+    geöffnet wurde. Sonst das Ende."""
+    tiefe = 0
+    for j in range(i, len(kern)):
+        c = kern[j]
+        if c in _AUF:
+            tiefe += 1
+        elif c in _ZU:
+            if tiefe == 0:
+                return j
+            tiefe -= 1
+        elif tiefe == 0 and c in zeichen:
+            return j
+    return len(kern)
+
+
+def anweisungsende(kern, i):
+    """Ende einer Anweisung ab i: das nächste ; oder ein Zeilenende, nach dem keine Fortsetzung folgt."""
+    j = i
+    while True:
+        j = ende_oben(kern, j, ';\n')
+        if j >= len(kern) or kern[j] != '\n':
+            return j
+        m = _NAECHSTES.match(kern, j)
+        if not m or m.group(1) not in '.?:+-*/|&,=':
+            return j
+        j += 1
+
+
+@functools.lru_cache(maxsize=None)
+def ternaer(code, kern):
+    """(Bedingung, dann, sonst) für a ? b : c auf oberster Ebene, sonst None."""
+    tiefe = 0
+    frage = -1
+    weitere = 0
+    for i, c in enumerate(kern):
+        if c in _AUF:
+            tiefe += 1
+        elif c in _ZU:
+            tiefe -= 1
+        elif tiefe == 0 and c == '?':
+            if kern[i + 1:i + 2] in ('.', '?') or (i and kern[i - 1] == '?'):
+                continue
+            if frage < 0:
+                frage = i
+            else:
+                weitere += 1
+        elif tiefe == 0 and c == ':' and frage >= 0:
+            if weitere:
+                weitere -= 1
+            else:
+                return code[:frage], code[frage + 1:i], code[i + 1:]
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def vorlage_teile(code):
+    """`a ${b} c` wird zu [('text', 'a '), ('code', 'b'), ('text', ' c')]. None, wenn code keine einzelne Vorlage ist."""
+    if len(code) < 2 or len(code) > 4000 or code[0] != '`' or code[-1] != '`':
+        return None
+    teile = []
+    text = ''
+    i = 1
+    n = len(code) - 1
+    while i < n:
+        c = code[i]
+        if c == '\\' and i + 1 < n:
+            text += code[i + 1]
+            i += 2
+        elif c == '`':
+            return None
+        elif code.startswith('${', i):
+            innen = code[i + 2:n]
+            zu = ende_oben(js_schichten(innen)[1], 0, '')
+            if zu >= len(innen):
+                return None
+            if text:
+                teile.append(('text', text))
+                text = ''
+            teile.append(('code', innen[:zu]))
+            i += 2 + zu + 1
+        else:
+            text += c
+            i += 1
+    if text:
+        teile.append(('text', text))
+    return tuple(teile)
+
+
+@functools.lru_cache(maxsize=None)
+def huelle_weg(code, locker=False):
+    """Entfernt harmlose Hüllen um einen Ausdruck: Klammern, String(...), JSON.stringify(...), .trim(), .slice(...),
+    || '' und Ähnliches. locker: auch einen beliebigen Aufruf mit genau einer Angabe, etwa t(b.name).
+    Zurück: (Rest, kodiert). kodiert heißt: Der Wert geht durch encodeURIComponent."""
+    kodiert = False
+    for _ in range(20):
+        code = code.strip()
+        if not code:
+            break
+        kern = js_schichten(code)[1]
+        ende = len(kern) - 1
+        if kern[0] in '([' and passend(kern, 0) == ende:
+            if kern[0] == '(' or len(teile_oben(code[1:-1], kern[1:-1], ',')) == 1:
+                code = code[1:-1]
+                continue
+        m = _HUELLE.match(kern)
+        frei = None if m or not locker else _LOCKER.match(kern)
+        if frei and kern[:frei.end() - 1].strip() in _SCHLUESSELWORTE:
+            frei = None
+        if (m or frei) and passend(kern, (m or frei).end() - 1) == ende:
+            anfang = (m or frei).end()
+            angaben = teile_oben(code[anfang:-1], kern[anfang:-1], ',')
+            if m or len(angaben) == 1:
+                kodiert = kodiert or kern.startswith('encodeURIComponent')
+                code = angaben[0]
+                continue
+        if kern.endswith(')'):
+            auf = oeffnend(kern, ende)
+            m = _METHODE_HINTEN.search(kern[:auf + 1]) if auf > 0 else None
+            if m:
+                code = code[:m.start()]
+                continue
+        geteilt = False
+        for zeichen in ('||', '??'):
+            t = teile_oben(code, kern, zeichen)
+            if len(t) == 2 and _FESTWERT.fullmatch(t[1]):
+                code = t[0]
+                geteilt = True
+                break
+        if not geteilt:
+            break
+    return code.strip(), kodiert
+
+
+def nur_vergleich(kern, a, e):
+    """True, wenn der Wert zwischen a und e nur geprüft oder verglichen wird und nicht ins Ergebnis fließt."""
+    j = e
+    for _ in range(12):
+        m = _METHODE_VORN.match(kern, j)
+        if m:
+            zu = passend(kern, m.end() - 1)
+            if zu < 0:
+                break
+            j = zu + 1
+            continue
+        m = _ZU_KLAMMER.match(kern, j) or _ERSATZ.match(kern, j)
+        if not m:
+            break
+        j = m.end()
+    if _VERGLEICH.match(kern, j) or _PRUEFT.match(kern, j):
+        return True
+    davor = kern[max(0, a - 120):a]
+    for _ in range(6):
+        m = _AUF_HUELLE.search(davor)
+        if not m:
+            break
+        davor = davor[:m.start()]
+    if _DAVOR.search(davor):
+        return True
+    m = _TREFFER.match(kern, j)
+    if m:       # x.match(…) liefert Teile von x: Eine Prüfung ist es nur als Bedingung (if, ? :, &&, !== null)
+        zu = passend(kern, m.end() - 1)
+        return zu >= 0 and bool(_VERGLEICH.match(kern, zu + 1) or
+                                (_BEDINGUNG.search(davor) and _ZU_KLAMMER.match(kern, zu + 1)))
+    return False
+
+
+def ist_schluessel(kern, a, e):
+    """Steht zwischen a und e der Name eines Felds in einem Objekt ({ name: … }) statt eines Werts?"""
+    if not re.match(r'\s*:(?!:)', kern[e:e + 20]):
+        return False
+    return kern[max(0, a - 200):a].rstrip()[-1:] in ('{', ',')
+
+
+def empfaenger(code, kern, i):
+    """Der Ausdruck vor dem Punkt an Stelle i, etwa „(b.betriebe || []).slice(0, 10)“ vor „.map(…)“."""
+    j = i
+    while True:
+        k = j - 1
+        while k >= 0 and kern[k].isspace():
+            k -= 1
+        if k < 0:
+            break
+        c = kern[k]
+        if c in ')]':
+            o = oeffnend(kern, k)
+            if o < 0:
+                break
+            j = o
+            continue
+        if c.isalnum() or c in '_$':
+            a = k
+            while a >= 0 and (kern[a].isalnum() or kern[a] in '_$'):
+                a -= 1
+            if kern[a + 1:k + 1] in _SCHLUESSELWORTE:
+                break
+            j = a + 1
+            k = a
+            while k >= 0 and kern[k].isspace():
+                k -= 1
+            if k >= 0 and kern[k] == '.':
+                j = k - 1 if k > 0 and kern[k - 1] == '?' else k
+                continue
+        break
+    return code[j:i].strip()
+
+
+def pfad_teile(text):
+    return [a or b or c for a, b, c in _TEIL.findall(text or '')]
+
+
+def knotenname(m):
+    """Name des Knotens aus einem Treffer von BEZUG ($('X'), $node["X"], $node.X), sonst None."""
+    name = m.group('n1') or m.group('n2') or m.group('n3') or m.group('n4')
+    return re.sub(r'\\(.)', r'\1', name) if name else None
+
+
+def bezug_lesen(kern, m):
+    """Aus einem Treffer von BEZUG oder LOSE: (Feldpfad, Stelle hinter dem Pfad). Eine Methode am Ende zählt nicht."""
+    teile = list(_TEIL.finditer(m.group('pfad')))
+    pfad = [t.group(1) or t.group(2) or t.group(3) for t in teile]
+    ende = m.end()
+    if teile and re.match(r'\s*\(', kern[ende:ende + 8]):
+        pfad.pop()
+        ende = m.start('pfad') + teile[-1].start()
+    return pfad, ende
+
+
+def json_vorlage(wert):
+    """Liest ein JSON mit {{ }} darin (Set im JSON-Modus, JSON einer Anfrage): (Struktur, Codes) oder None, wenn es sich
+    nicht lesen lässt. In der Struktur steht für den Block Nummer i die Marke \\x01i\\x01."""
+    if not isinstance(wert, str):
+        return None
+    if not wert.startswith('='):
+        try:
+            return json.loads(wert), []
+        except ValueError:
+            return None
+    text = wert[1:]
+    teile, codes = [], []
+    i, im_text, n = 0, False, len(text)
+    while i < n:
+        if text.startswith('{{', i):
+            zu = text.find('}}', i + 2)
+            if zu < 0:
+                return None
+            codes.append(text[i + 2:zu])
+            marke = f'\x01{len(codes) - 1}\x01'
+            teile.append(marke if im_text else '"' + marke + '"')
+            i = zu + 2
+            continue
+        c = text[i]
+        if im_text and c == '\\':
+            teile.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == '"':
+            im_text = not im_text
+        teile.append(c)
+        i += 1
+    try:
+        return json.loads(''.join(teile), strict=False), codes
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Teile eines Werts: ('text', fester Text), ('ein', Feld der Eingabe, Knoten, kodiert), ('ganz', Feld, Knoten) für ein
+# Objekt mit der ganzen Eingabe darin, ('misch', Code, Felder der Eingabe), ('unklar', Grund, Knoten), wenn sich die
+# Herkunft nicht verfolgen lässt, und ('dyn', Code, Quelle) für Veränderliches ohne Eingabe (Quelle: Knoten, dessen
+# Daten es sind, etwa ein Baustein, sonst '')
+# ---------------------------------------------------------------------------------------------------------------------
+def gewicht(seg):
+    """Wie viel Eingabe in einer Folge von Teilen steckt: 7 = nur die Eingabe, 4 = Herkunft offen, 1 = nur fester Text."""
+    if not seg:
+        return 0
+    kern = [s for s in seg if not (s[0] == 'text' and not s[1].strip())]
+    arten = {s[0] for s in seg}
+    if len(kern) == 1 and kern[0][0] in ('ein', 'ganz'):
+        return 7
+    if arten & {'ein', 'ganz'}:
+        return 6
+    if 'misch' in arten:
+        return 5
+    if 'unklar' in arten:
+        return GEWICHT_UNKLAR
+    if any(s[0] == 'dyn' and s[2] for s in seg):
+        return 3
+    if 'dyn' in arten:
+        return 2
+    return 1
+
+
+def rang(seg):
+    """Reihenfolge, in der maximum() wählt: erst die Stufe (nur Eingabe, Eingabe darin, Herkunft offen, Daten eines anderen
+    Knotens), bei gleicher Stufe die Folge, in der der veränderliche Teil den Host einer Adresse bestimmt, dann gewicht().
+    So verdeckt eine Fassung mit festem Host nicht die andere, in der die Eingabe den Host stellt."""
+    g = gewicht(seg)
+    stufe = 4 if g == 7 else 3 if g >= 5 else 2 if g == GEWICHT_UNKLAR else 1 if g == 3 else 0
+    host = 0
+    if stufe:
+        for s, lage in url_lage(seg):
+            if lage == 'host' and s[0] in ('ein', 'misch', 'ganz'):
+                host = 2
+            elif lage == 'host' and not host and (s[0] == 'unklar' or (s[0] == 'dyn' and s[2])):
+                host = 1
+    return stufe, host, g
+
+
+def maximum(*folgen):
+    """Die Folge mit dem meisten Anteil aus der Eingabe (die erste bei Gleichstand), siehe rang()."""
+    beste = None
+    for seg in folgen:
+        if seg is not None and (beste is None or rang(seg) > rang(beste)):
+            beste = seg
+    return beste if beste is not None else []
+
+
+def eingabe_felder(seg):
+    """Namen der Felder aus der Eingabe, die in einer Folge von Teilen stecken."""
+    felder = []
+    for s in seg:
+        if s[0] in ('ein', 'ganz'):
+            felder.append(s[1])
+        elif s[0] == 'misch':
+            felder.extend(s[2])
+    return list(dict.fromkeys(felder))
+
+
+def zusammen(folgen, code):
+    """Ein ganzes Objekt oder eine Liste mit festen Schlüsseln: Werte aus der Eingabe darin machen es zu ('misch')."""
+    felder = [f for seg in folgen for f in eingabe_felder(seg)]
+    if felder:
+        return [('misch', code, list(dict.fromkeys(felder)))]
+    return [('dyn', code, '')]
+
+
+def kern_teile(seg):
+    return [s for s in seg if not (s[0] == 'text' and not s[1].strip())]
+
+
+def verdichten(teile):
+    """Fasst Teile zusammen, damit verkettete Werte über viele Schritte nicht beliebig lang werden: fester Text am Stück
+    wird ein Text, mehrere veränderliche Teile hintereinander werden einer (sie stehen in der Adresse an derselben Stelle)."""
+    fertig, lauf = [], []
+
+    def lauf_abschliessen():
+        if len(lauf) == 1:
+            fertig.append(lauf[0])
+        elif lauf:
+            felder = eingabe_felder(lauf)
+            if all(s[0] == 'ein' and s[3] for s in lauf):
+                fertig.append(('ein', felder[0], lauf[0][2], True))
+            elif felder:
+                fertig.append(('misch', '…', felder))
+            else:
+                fertig.append(next((s for s in lauf if s[0] == 'unklar'), None) or
+                              next((s for s in lauf if s[0] == 'dyn' and s[2]), lauf[0]))
+        lauf.clear()
+    for s in teile:
+        if s[0] != 'text':
+            lauf.append(s)
+            continue
+        lauf_abschliessen()
+        if fertig and fertig[-1][0] == 'text':
+            fertig[-1] = ('text', fertig[-1][1] + s[1])
+        else:
+            fertig.append(s)
+    lauf_abschliessen()
+    if len(fertig) > 40:        # sehr lange Werte: Der Host steht vorn, der Rest wird ein Teil (zählt dann als Pfad)
+        rest = [s for s in fertig[30:] if s[0] != 'text']
+        fertig = fertig[:30]
+        if rest:
+            lauf.extend(rest)
+            lauf_abschliessen()
+    return fertig
+
+
+def nur_eingabe(seg):
+    """Das Feld der Eingabe, wenn der Wert als Ganzes aus der Eingabe kommt (unverändert oder nur ergänzt), sonst None."""
+    kern = kern_teile(seg)
+    return kern[0][1] if len(kern) == 1 and kern[0][0] in ('ein', 'ganz') else None
+
+
+def nur_unklar(seg):
+    """Der Teil, wenn der ganze Wert eine offene Herkunft hat, sonst None."""
+    kern = kern_teile(seg)
+    return kern[0] if len(kern) == 1 and kern[0][0] == 'unklar' else None
+
+
+_HINTER_HOST = re.compile(r'\s*(?:https?://[^/?#\s]+|\x00[^/?#\s]*)[/?#]', re.I)
+
+
+def url_lage(seg):
+    """Ordnet jedem veränderlichen Teil einer Adresse zu, wo er steht: 'host', 'pfad' oder 'abfrage'."""
+    fest = ''
+    lagen = []
+    hinter_host = abfrage = False
+    for s in seg:
+        if s[0] == 'text':
+            fest += s[1]
+            abfrage = abfrage or (hinter_host and ('?' in s[1] or '#' in s[1]))
+            continue
+        # Nach dem Host (fest oder veränderlich, \x00) folgt ein /, ? oder #: Ab dort ist es Pfad oder Abfrage
+        if not hinter_host and _HINTER_HOST.match(fest[:2000]):
+            hinter_host, abfrage = True, '?' in fest or '#' in fest
+        lagen.append((s, ('abfrage' if abfrage else 'pfad') if hinter_host else 'host'))
+        fest += '\x00'
+    return lagen
+
+
+def texte(wert, pfad='', eltern=None):
+    """Alle Zeichenketten in den Parametern eines Knotens: (Pfad, Wert, umgebendes Objekt)."""
+    if isinstance(wert, str):
+        yield pfad, wert, eltern
+    elif isinstance(wert, dict):
+        for k, v in wert.items():
+            yield from texte(v, f'{pfad}.{k}' if pfad else str(k), wert)
+    elif isinstance(wert, list):
+        for i, v in enumerate(wert):
+            yield from texte(v, f'{pfad}[{i}]', eltern)
+
+
+def ort(pfad, eltern):
+    """Wo im Knoten ein Wert steht: bei Feldlisten der Name des Felds, sonst der Pfad des Parameters."""
+    name = eltern.get('name') if isinstance(eltern, dict) else None
+    if isinstance(name, str) and name and not name.startswith('=') and len(name) <= 40 and pfad.endswith(('.value', 'Value')):
+        return f'Feld {anf(name)}'
+    return f'Parameter {pfad}'
+
+
+def echt(wert):
+    """Sieht ein fest eingetragener Wert wie ein echter Schlüssel aus (und nicht wie ein Platzhalter)?"""
+    wert = str(wert).strip()
+    if wert.startswith('=') or '{{' in wert:
+        return False
+    # „Bearer …“, „Token …“, „DeepL-Auth-Key …“: ein Wort für das Verfahren, dahinter der Schlüssel
+    wert = re.sub(r'^[A-Za-z][A-Za-z0-9_-]{1,30}\s+(?=\S+$)', '', wert)
+    if len(wert) < 8 or re.search(r'\s', wert) or PLATZHALTER.search(wert):
+        return False
+    return bool(re.search(r'\d', wert) or (re.search(r'[a-z]', wert) and re.search(r'[A-Z]', wert)))
+
+
+def schluesselname(name):
+    """Heißt ein Feld wie ein Zugang (Authorization, X-API-Key, X-RapidAPI-Key, appid, access_token, password …)?"""
+    n = re.sub(r'[^a-z0-9]', '', str(name).lower())
+    if not n or KEIN_ZUGANG.search(n):
+        return False
+    return n in ('key', 'auth', 'pwd', 'pass') or n.endswith(SCHLUESSEL_ENDE)
+
+
+def kopfname(name):
+    """Heißt eine Kopfzeile wie ein Zugang? Dort ist jeder Name auf „…-Key“ einer (x-functions-key, xi-api-key), dazu Cookie."""
+    n = re.sub(r'[^a-z0-9]', '', str(name).lower())
+    return schluesselname(name) or n == 'cookie' or (n.endswith('key') and not KEIN_ZUGANG.search(n))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Der Workflow: Knoten, Verbindungen und die Frage, woher ein Wert kommt
+# ---------------------------------------------------------------------------------------------------------------------
+class Workflow:
+    def __init__(self, roh):
+        self.roh = roh
+        self.name = str(roh.get('name') or '')
+        self.knoten = {}            # Schlüssel → Knoten. Heißen mehrere Knoten gleich, heißt der zweite hier „Name [2]“
+        self.gleichnamig = {}       # Name in n8n → Schlüssel aller Knoten mit diesem Namen
+        self.doppelt = []           # Namen, die mehrfach vorkommen
+        knoten = [k for k in roh.get('nodes') or [] if isinstance(k, dict)]
+        namen = {str(k.get('name') or '') for k in knoten}
+        for k in knoten:
+            name = str(k.get('name') or '')
+            schluessel = name
+            if name in self.gleichnamig:
+                if name not in self.doppelt:
+                    self.doppelt.append(name)
+                nr = len(self.gleichnamig[name]) + 1
+                schluessel = f'{name} [{nr}]'
+                while schluessel in namen or schluessel in self.knoten:
+                    nr += 1
+                    schluessel = f'{name} [{nr}]'
+            self.gleichnamig.setdefault(name, []).append(schluessel)
+            self.knoten[schluessel] = k
+        self.aus = {n: [] for n in self.knoten}       # je Ausgang die Liste der (Ziel, Eingang)
+        self.ein = {n: [] for n in self.knoten}       # (Quelle, Ausgang, Eingang)
+        self.ki_aus = {n: [] for n in self.knoten}    # Unterknoten: (KI-Knoten, Art der Verbindung)
+        self.ki_ein = {n: [] for n in self.knoten}    # KI-Knoten: (Unterknoten, Art der Verbindung)
+        verbindungen = roh.get('connections')
+        for quelle, arten in (verbindungen.items() if isinstance(verbindungen, dict) else []):
+            if quelle not in self.gleichnamig or not isinstance(arten, dict):
+                continue
+            for art, ausgaenge in arten.items():
+                for nr, ziele in enumerate(ausgaenge if isinstance(ausgaenge, list) else []):
+                    for z in ziele if isinstance(ziele, list) else []:
+                        ziel = z.get('node') if isinstance(z, dict) else None
+                        if not isinstance(ziel, str) or ziel not in self.gleichnamig:
+                            continue
+                        eingang = z.get('index') if isinstance(z.get('index'), int) else 0
+                        # Bei gleichem Namen ist offen, welcher Knoten gemeint ist: Die Verbindung gilt für alle
+                        for q in self.gleichnamig[quelle]:
+                            for zs in self.gleichnamig[ziel]:
+                                if art == 'main':
+                                    while len(self.aus[q]) <= nr:
+                                        self.aus[q].append([])
+                                    self.aus[q][nr].append((zs, eingang))
+                                    self.ein[zs].append((q, nr, eingang))
+                                else:
+                                    self.ki_aus[q].append((zs, art))
+                                    self.ki_ein[zs].append((q, art))
+        self._code = {}
+        self._nach = {}
+        self._vor = {}
+        self._prod = {}
+        self._memo = {}             # fertige Antworten der Herkunftssuche
+        self._offen = {}            # Fragen in Arbeit → Stelle im Stapel (für Kreise)
+        self._rahmen = []           # je Frage in Arbeit: kleinste Stelle im Stapel, von der ihre Antwort abhängt
+        self._vorlaeufig = {}       # Antworten, die von einer offenen Frage abhängen → (Antwort, Stelle dieser Frage)
+        self._je_rahmen = {}        # Stelle im Stapel → vorläufige Antworten, die daran hängen
+        self._offen_pfade = {}      # Frage ohne Feld → (Feld, Stelle) der offenen Fragen dazu
+        self._ausdruecke = {}       # fertige Antworten von ausdruck(), nur solche ohne vorläufigen Teil
+        self.kreise = 0
+        self.frist = time.monotonic() + FRIST
+        self.schritte = 0
+        self.erschoepft = False     # das Budget an Auflösungen ist aufgebraucht
+        self.eingaenge = [n for n in self.knoten if self.art(n) in EINGANG and self.an(n)]
+        self.oeffentliche = [n for n in self.eingaenge if self.oeffentlich(n)]
+        self._erreichbar = None
+
+    def art(self, name):
+        return str(self.knoten[name].get('type') or '').rsplit('.', 1)[-1].lower()
+
+    def echter_name(self, name):
+        return str(self.knoten[name].get('name') or '')
+
+    def p(self, name):
+        p = self.knoten[name].get('parameters')
+        return p if isinstance(p, dict) else {}
+
+    def version(self, name):
+        try:
+            return float(self.knoten[name].get('typeVersion') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def an(self, name):
+        return not self.knoten[name].get('disabled')
+
+    def ziele(self, name, ausgang=None):
+        ausg = self.aus.get(name) or []
+        if ausgang is None:
+            return [z for a in ausg for z, _ in a]
+        return [z for z, _ in ausg[ausgang]] if ausgang < len(ausg) else []
+
+    def _lauf(self, name, kanten, merker):
+        if name not in merker:
+            gesehen = set()
+            offen = list(kanten(name))
+            while offen:
+                n = offen.pop()
+                if n not in gesehen:
+                    gesehen.add(n)
+                    offen.extend(kanten(n))
+            merker[name] = gesehen
+        return merker[name]
+
+    def nachfahren(self, name):
+        return self._lauf(name, self.ziele, self._nach)
+
+    def vorfahren(self, name):
+        return self._lauf(name, lambda n: [q for q, _, _ in self.ein.get(n, [])], self._vor)
+
+    def oeffentlich(self, name):
+        """Ein Eingang, den jeder aufrufen kann, der die Adresse kennt."""
+        p = self.p(name)
+        if p.get('authentication') not in (None, '', 'none'):
+            return False
+        return self.art(name) != 'chattrigger' or p.get('public') is True
+
+    def von_eingang(self, name):
+        """Erreicht ein öffentlicher Eingang diesen Knoten (über main-Verbindungen)?"""
+        if self._erreichbar is None:
+            self._erreichbar = set()
+            for e in self.oeffentliche:
+                self._erreichbar |= {e} | self.nachfahren(e)
+        return name in self._erreichbar
+
+    def erreichbar(self, name):
+        """von_eingang, für einen Unterknoten (Werkzeug, Sprachmodell) über den KI-Knoten, an dem er hängt."""
+        gesehen, offen = set(), [name]
+        while offen:
+            n = offen.pop()
+            if n in gesehen:
+                continue
+            gesehen.add(n)
+            if self.von_eingang(n):
+                return True
+            offen.extend(z for z, _ in self.ki_aus.get(n, []))
+        return False
+
+    def baustein(self, name):
+        """ID des Bausteins, den ein Knoten „Execute Workflow“ aufruft, sonst ''."""
+        if self.art(name) != 'executeworkflow':
+            return ''
+        wert = self.p(name).get('workflowId')
+        if isinstance(wert, dict):
+            wert = wert.get('value')
+        wert = str(wert or '').lstrip('=').strip()
+        return wert if wert in BAUSTEINE else ''
+
+    def fehler_nr(self, name):
+        """Nummer des Fehlerausgangs (onError: continueErrorOutput) eines IF oder Switch, sonst None."""
+        if self.knoten[name].get('onError') != 'continueErrorOutput':
+            return None
+        anzahl = self.ausgaenge(name)
+        return anzahl - 1 if anzahl else None
+
+    def ausgaenge(self, name):
+        """Zahl der Ausgänge eines IF oder Switch (mit Fehlerausgang); None, wenn sie sich nicht sicher bestimmen lässt."""
+        extra = 1 if self.knoten[name].get('onError') == 'continueErrorOutput' else 0
+        if self.art(name) == 'if':
+            return 2 + extra
+        p = self.p(name)
+        if self.art(name) != 'switch' or self.version(name) < 3:
+            return None
+        if p.get('mode', 'rules') != 'rules':
+            anzahl = p.get('numberOutputs')
+            return anzahl + extra if isinstance(anzahl, int) and not isinstance(anzahl, bool) else None
+        regeln = p.get('rules', {}).get('values') if isinstance(p.get('rules'), dict) else None
+        if not isinstance(regeln, list) or not regeln:
+            return None
+        optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+        return len(regeln) + (1 if optionen.get('fallbackOutput') == 'extra' else 0) + extra
+
+    def ausgang_name(self, name, nr):
+        if nr == self.fehler_nr(name):
+            return 'Fehler'
+        if self.art(name) == 'if':
+            return 'wahr' if nr == 0 else 'falsch'
+        regeln = self.p(name).get('rules', {}).get('values') if isinstance(self.p(name).get('rules'), dict) else None
+        if isinstance(regeln, list) and nr < len(regeln) and isinstance(regeln[nr], dict):
+            schluessel = regeln[nr].get('outputKey')
+            if regeln[nr].get('renameOutput') and isinstance(schluessel, str) and schluessel:
+                return f'{nr} ({kuerzen(schluessel, 30)})'
+        return str(nr)
+
+    # --- Woher kommt ein Wert? -------------------------------------------------------------------------------------
+    def reicht_durch(self, name):
+        """Gibt der Knoten seine Einträge unverändert weiter (IF, Switch, Filter, Merge, abgeschaltete Knoten …)?"""
+        if not self.an(name):
+            return True
+        art = self.art(name)
+        if art == 'merge':
+            return self.p(name).get('mode') != 'combineBySql'
+        if art == 'datatable':
+            return str(self.p(name).get('operation') or '') in ('rowExists', 'rowNotExists')
+        if art == 'itemlists':
+            return str(self.p(name).get('operation') or '') in ('removeDuplicates', 'sort', 'limit')
+        return art in DURCHREICHER
+
+    def produzenten(self, name):
+        """Knoten, deren Ausgabe als $json bei diesem Knoten ankommt. Knoten, die Einträge nur durchreichen, werden
+        übersprungen. Bei einem Unterknoten zählt sein KI-Knoten."""
+        if name in self._prod:
+            return self._prod[name]
+        erg, gesehen, offen = set(), set(), [name]
+        while offen:
+            n = offen.pop()
+            quellen = [q for q, _, _ in self.ein.get(n, [])]
+            if not quellen:
+                for z, _ in self.ki_aus.get(n, []):
+                    if z not in gesehen:
+                        gesehen.add(z)
+                        offen.append(z)
+                continue
+            for q in quellen:
+                if q in gesehen:
+                    continue
+                gesehen.add(q)
+                if self.reicht_durch(q):
+                    offen.append(q)
+                else:
+                    erg.add(q)
+        self._prod[name] = erg
+        return erg
+
+    def hinter(self, name):
+        """Der Knoten selbst oder, wenn er nur durchreicht, die Knoten, deren Daten er weitergibt."""
+        return self.produzenten(name) if self.reicht_durch(name) else {name}
+
+    def _merke(self, schluessel, rechnen):
+        """Beantwortet eine Frage der Herkunftssuche mit Zwischenspeicher. Ein Kreis bringt nichts Neues: Die Frage, die
+        wiederkehrt, trägt dort nichts bei. Eine Antwort, die von einer offenen Frage weiter oben abhängt, gilt nur
+        vorläufig: Sie wird verwendet, bis diese Frage fertig ist, und danach neu gerechnet, denn dort fehlte noch ein Teil."""
+        if schluessel in self._memo:
+            return self._memo[schluessel]
+        # Jede Antwort, die nicht endgültig ist, zählt in self.kreise: Ausdrücke, die so eine Antwort enthalten, speichert
+        # ausdruck() nicht
+        if schluessel in self._offen:
+            self.kreise += 1
+            if self._rahmen:
+                self._rahmen[-1][0] = min(self._rahmen[-1][0], self._offen[schluessel])
+            return []
+        vorlaeufig = self._vorlaeufig.get(schluessel)
+        if vorlaeufig is not None:
+            self.kreise += 1
+            if self._rahmen:
+                self._rahmen[-1][0] = min(self._rahmen[-1][0], vorlaeufig[1])
+            return vorlaeufig[0]
+        # Dieselbe Frage mit verlängertem Feld (x.a, dann x.b.a, …) ist ein Kreis, der nie wiederkehrt: wie oben behandeln
+        basis, pfad = schluessel[:-1], schluessel[-1]
+        for frueher, stelle_frueher in self._offen_pfade.get(basis, ()):
+            if len(pfad) > len(frueher) and pfad[len(pfad) - len(frueher):] == frueher:
+                self.kreise += 1
+                if self._rahmen:
+                    self._rahmen[-1][0] = min(self._rahmen[-1][0], stelle_frueher)
+                return []
+        if self.schritte >= BUDGET or len(self._rahmen) >= TIEFE or len(pfad) > 12 or time.monotonic() > self.frist:
+            self.kreise += 1
+            if self.schritte >= BUDGET or time.monotonic() > self.frist:
+                self.erschoepft = True
+            if self._rahmen:
+                self._rahmen[-1][0] = -1
+            return [('unklar', 'budget' if self.erschoepft else 'tief', '')]
+        self.schritte += 1
+        stelle = len(self._rahmen)
+        self._offen[schluessel] = stelle
+        self._offen_pfade.setdefault(basis, []).append((pfad, stelle))
+        self._rahmen.append([stelle + 1])
+        try:
+            erg = rechnen()
+        finally:
+            abhaengig = self._rahmen.pop()[0]
+            del self._offen[schluessel]
+            self._offen_pfade[basis].pop()
+            for k in self._je_rahmen.pop(stelle, ()):       # hingen an dieser Frage: jetzt veraltet
+                self._vorlaeufig.pop(k, None)
+        if self._rahmen:
+            self._rahmen[-1][0] = min(self._rahmen[-1][0], abhaengig)
+        if abhaengig >= stelle:
+            self._memo[schluessel] = erg
+        elif abhaengig >= 0:
+            self._vorlaeufig[schluessel] = (erg, abhaengig)
+            self._je_rahmen.setdefault(abhaengig, []).append(schluessel)
+        return erg
+
+    def bezug_segmente(self, name, quelle, pfad, kodiert=False):
+        """Woher der Wert eines Bezugs wie $json.a.b (quelle None) oder $('X').item.json.a kommt."""
+        if quelle is None:
+            quellen = self.produzenten(name)
+        else:
+            quellen = set()
+            for s in self.gleichnamig.get(quelle, []):
+                quellen |= self.hinter(s)
+        beste = [('dyn', '', '')]
+        for q in sorted(quellen):
+            seg = self.feld(q, pfad)
+            if rang(seg) > rang(beste):
+                beste = seg
+        if kodiert:
+            beste = [(s[0], s[1], s[2], True) if s[0] == 'ein' else s for s in beste]
+        return beste
+
+    def feld(self, q, pfad):
+        pfad = tuple(pfad)
+        return self._merke(('feld', q, pfad), lambda: self.feld_segmente(q, pfad))
+
+    def offen_oder_fest(self, q, grund='knoten'):
+        """Für einen Knoten, dessen Ausgabe sich nicht verfolgen lässt: offen, wenn die Eingabe ihn erreicht."""
+        return [('unklar', grund, q)] if self.von_eingang(q) else [('dyn', '', q)]
+
+    def feld_segmente(self, q, pfad):
+        """Woher das Feld pfad in der Ausgabe des Knotens q kommt."""
+        art = self.art(q)
+        p = self.p(q)
+        if art == 'webhook':
+            if not pfad or pfad[0] in ('body', 'query', 'params', 'headers'):
+                return [('ein', '.'.join(pfad) or 'alles', q, False)]
+            return [('dyn', '', '')]
+        if art == 'formtrigger' or (art == 'chattrigger' and p.get('public') is True and pfad[:1] in ((), ('chatInput',))):
+            return [('ein', '.'.join(pfad) or 'alles', q, False)]
+        if art == 'set':
+            return self.set_feld(q, pfad)
+        if art == 'code':
+            return self.code_feld(q, pfad) if isinstance(p.get('jsCode'), str) else self.offen_oder_fest(q, 'code')
+        if art == 'splitout':
+            return self.splitout_feld(q, pfad)
+        if art == 'aggregate':
+            return self.aggregate_feld(q, pfad)
+        if art == 'renamekeys':
+            return self.umbenannt_feld(q, pfad)
+        if art == 'datetime':
+            return self.datum_feld(q, pfad)
+        if art == 'summarize':
+            return self.summe_feld(q, pfad)
+        if art == 'datatable':
+            return self.tabelle_feld(q, pfad)
+        if art == 'merge':
+            return self.offen_oder_fest(q, 'sql')
+        if art == 'executeworkflow':
+            return [('dyn', '', q)] if self.baustein(q) else self.offen_oder_fest(q, 'unterworkflow')
+        if art in KETTEN or art in KI_DIREKT:
+            return self.offen_oder_fest(q, 'ki')
+        if art in QUELLEN or art.endswith('trigger'):
+            return [('dyn', '', q)]
+        if art == 'googlesheets' and str(p.get('operation') or 'read') in ('read', 'lookup', 'get', 'getAll'):
+            return [('dyn', '', q)]
+        return self.offen_oder_fest(q)
+
+    def set_felder(self, name):
+        """Felder eines Set-Knotens als {Name: Wert} (Namen mit Punkt bleiben ganz); None, wenn sie sich nicht sicher
+        lesen lassen."""
+        p = self.p(name)
+        if p.get('mode', 'manual') != 'manual':
+            return None
+        felder = {}
+        if self.version(name) >= 3.3:
+            eintraege = p.get('assignments', {}).get('assignments') if isinstance(p.get('assignments'), dict) else None
+            schluessel = ('value',)
+        elif self.version(name) >= 3:
+            eintraege = p.get('fields', {}).get('values') if isinstance(p.get('fields'), dict) else None
+            schluessel = ('stringValue', 'numberValue', 'booleanValue', 'arrayValue', 'objectValue')
+        else:
+            return None
+        for e in eintraege if isinstance(eintraege, list) else []:
+            n = e.get('name') if isinstance(e, dict) else None
+            if not isinstance(n, str) or not n or n.startswith('='):
+                return None
+            felder[n] = next((e[s] for s in schluessel if s in e), None)
+        return felder
+
+    def set_reicht_durch(self, name, pfad=None):
+        """Gibt ein Set-Knoten die übrigen Felder der Eingabe weiter (bei pfad: dieses Feld)?"""
+        p = self.p(name)
+        if self.version(name) >= 3.3:
+            if p.get('includeOtherFields') is not True:
+                return False
+            art = p.get('include', 'all')
+        else:
+            art = p.get('include', 'all')
+            if art == 'none':
+                return False
+        if art in ('selected', 'except') and pfad:
+            namen = {x.strip() for x in str(p.get('includeFields' if art == 'selected' else 'excludeFields') or '').split(',')}
+            treffer = pfad[0] in namen or '.'.join(pfad) in namen
+            return treffer if art == 'selected' else not treffer
+        return True
+
+    def set_feld(self, q, pfad):
+        p = self.p(q)
+        if p.get('mode') == 'raw':
+            seg = self.json_feld(q, p.get('jsonOutput'), pfad)
+            if seg is not None:
+                return seg
+        else:
+            felder = self.set_felder(q)
+            if felder is None:
+                return self.offen_oder_fest(q)
+            if not pfad:
+                seg = zusammen([self.segmente(q, w) if isinstance(w, str) else [('text', str(w))] for w in felder.values()],
+                               '{…}')
+                if self.set_reicht_durch(q):
+                    seg = maximum(seg, self.bezug_segmente(q, None, []))
+                return seg
+            for laenge in range(len(pfad), 0, -1):          # „betrieb.name“ vor „betrieb“
+                schluessel = '.'.join(pfad[:laenge])
+                if schluessel in felder:
+                    wert = felder[schluessel]
+                    return self.segmente(q, wert, pfad[laenge:]) if isinstance(wert, str) else [('text', str(wert))]
+            unter = [w for n, w in felder.items() if n.startswith(pfad[0] + '.')]
+            if unter:
+                return zusammen([self.segmente(q, w) if isinstance(w, str) else [('text', str(w))] for w in unter], '{…}')
+        if self.set_reicht_durch(q, pfad):
+            return self.bezug_segmente(q, None, pfad)
+        return [('dyn', '', '')]
+
+    def json_feld(self, q, vorlage, pfad):
+        """Woher das Feld pfad in einem JSON mit {{ }} kommt. None, wenn es dort fehlt."""
+        gelesen = json_vorlage(vorlage)
+        if gelesen is None:
+            felder = eingabe_felder(self.segmente(q, vorlage)) if isinstance(vorlage, str) else []
+            return [('misch', str(vorlage), felder)] if felder else self.offen_oder_fest(q, 'json')
+        return self.json_wert(q, gelesen[0], gelesen[1], tuple(pfad))
+
+    def json_wert(self, q, wert, codes, pfad):
+        if isinstance(wert, str):
+            stuecke = re.split(r'\x01(\d+)\x01', wert)
+            if len(stuecke) == 3 and not stuecke[0] and not stuecke[2]:        # der ganze Wert ist ein Block
+                return self.ausdruck(q, codes[int(stuecke[1])], None, pfad)
+            teile = []
+            for i, s in enumerate(stuecke):
+                if i % 2:
+                    teile.extend(self.ausdruck(q, codes[int(s)]))
+                elif s:
+                    teile.append(('text', s))
+            return verdichten(teile) or [('text', '')]
+        if isinstance(wert, dict):
+            if pfad:
+                return self.json_wert(q, wert[pfad[0]], codes, pfad[1:]) if pfad[0] in wert else None
+            return zusammen([self.json_wert(q, v, codes, ()) or [] for v in wert.values()], '{…}')
+        if isinstance(wert, list):
+            folgen = [f for f in (self.json_wert(q, v, codes, pfad) for v in wert) if f is not None]
+            if not folgen:
+                return None if pfad else [('text', '')]
+            return maximum(*folgen) if pfad else zusammen(folgen, '[…]')
+        return None if pfad else [('text', json.dumps(wert))]
+
+    def splitout_feld(self, q, pfad):
+        """Split Out: Jeder Eintrag ist ein Element der Liste aus fieldToSplitOut."""
+        p = self.p(q)
+        felder = [f.strip() for f in str(p.get('fieldToSplitOut') or '').split(',') if f.strip()]
+        if not felder or any('{{' in f or f.startswith('=') for f in felder):
+            return self.offen_oder_fest(q)
+        optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+        ziel = str(optionen.get('destinationFieldName') or '').strip()
+        folgen = []
+        for f in felder:
+            teile = [f] if optionen.get('disableDotNotation') else f.split('.')
+            folgen.append(self.bezug_segmente(q, None, teile + list(pfad)))           # das Element ist ein Objekt
+            if pfad and pfad[0] in (ziel or teile[-1], teile[-1]):
+                folgen.append(self.bezug_segmente(q, None, teile + list(pfad[1:])))    # das Element ist ein einfacher Wert
+        art = p.get('include', 'noOtherFields')
+        andere = {x.strip() for x in str(p.get('fieldsToInclude') or '').split(',')}
+        if art == 'allOtherFields' or (art == 'selectedOtherFields' and pfad and pfad[0] in andere):
+            folgen.append(self.bezug_segmente(q, None, pfad))
+        return maximum(*folgen)
+
+    def aggregate_feld(self, q, pfad):
+        """Aggregate: Listen aus Feldern der Eingabe."""
+        p = self.p(q)
+        if not pfad:
+            return self.bezug_segmente(q, None, [])
+        if p.get('aggregate', 'aggregateIndividualFields') == 'aggregateAllItemData':
+            ziel = str(p.get('destinationFieldName') or 'data')
+            return self.bezug_segmente(q, None, pfad[1:]) if pfad[0] == ziel else [('dyn', '', '')]
+        eintraege = p.get('fieldsToAggregate', {}).get('fieldToAggregate') if isinstance(p.get('fieldsToAggregate'), dict) else None
+        if not isinstance(eintraege, list):
+            return self.offen_oder_fest(q)
+        for e in eintraege:
+            if not isinstance(e, dict):
+                continue
+            quelle = str(e.get('fieldToAggregate') or '').strip()
+            name = str(e.get('outputFieldName') or '').strip() if e.get('renameField') else ''
+            if quelle and pfad[0] in (name or quelle, quelle.split('.')[-1]):
+                return self.bezug_segmente(q, None, quelle.split('.') + list(pfad[1:]))
+        return [('dyn', '', '')]
+
+    def umbenannt_feld(self, q, pfad):
+        """Rename Keys: ein Feld unter neuem Namen, alle anderen unverändert."""
+        p = self.p(q)
+        mehr = p.get('additionalOptions') if isinstance(p.get('additionalOptions'), dict) else {}
+        eintraege = p.get('keys', {}).get('key') if isinstance(p.get('keys'), dict) else []
+        if mehr.get('regexReplacement') or not pfad:
+            return self.offen_oder_fest(q) if mehr.get('regexReplacement') else self.bezug_segmente(q, None, [])
+        for e in eintraege if isinstance(eintraege, list) else []:
+            if isinstance(e, dict) and str(e.get('newKey') or '').strip() == pfad[0]:
+                return self.bezug_segmente(q, None, str(e.get('currentKey') or '').strip().split('.') + list(pfad[1:]))
+        if any(isinstance(e, dict) and str(e.get('currentKey') or '').strip() == pfad[0] for e in eintraege or []):
+            return [('dyn', '', '')]
+        return self.bezug_segmente(q, None, pfad)
+
+    def datum_feld(self, q, pfad):
+        """Date & Time: das Ergebnisfeld, dazu die Eingabe nur mit options.includeInputFields (in typeVersion 1 immer)."""
+        p = self.p(q)
+        if self.version(q) < 2:
+            return [('dyn', '', '')] if pfad[:1] == (str(p.get('dataPropertyName') or 'data'),) else \
+                self.bezug_segmente(q, None, pfad)
+        ziel = str(p.get('outputFieldName') or DATUM_FELD.get(str(p.get('operation') or 'getCurrentDate'), 'newDate'))
+        if pfad[:1] == (ziel,):
+            return [('dyn', '', '')]
+        optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+        return self.bezug_segmente(q, None, pfad) if optionen.get('includeInputFields') is True else [('dyn', '', '')]
+
+    def summe_feld(self, q, pfad):
+        """Summarize: Felder zum Teilen kommen aus der Eingabe, ebenso angehängte, verkettete, kleinste und größte Werte."""
+        p = self.p(q)
+        if not pfad:
+            return self.offen_oder_fest(q)
+        teilung = {x.strip() for x in str(p.get('fieldsToSplitBy') or '').split(',') if x.strip()}
+        if pfad[0] in teilung:
+            return self.bezug_segmente(q, None, pfad)
+        eintraege = p.get('fieldsToSummarize', {}).get('values') if isinstance(p.get('fieldsToSummarize'), dict) else None
+        vorsilben = {'append': 'appended_', 'concatenate': 'concatenated_', 'min': 'min_', 'max': 'max_'}
+        for e in eintraege if isinstance(eintraege, list) else []:      # das Feld heißt dort „appended_“ + Name, Punkte fallen weg
+            feld = str(e.get('field') or '').strip() if isinstance(e, dict) else ''
+            vorn = vorsilben.get(str(e.get('aggregation') or '')) if feld else None
+            if vorn and pfad[0] in (vorn + feld, vorn + feld.replace('.', '_'), vorn + feld.replace('.', '')):
+                return self.bezug_segmente(q, None, feld.split('.') + list(pfad[1:]))
+        m = re.match(r'(?:append(?:ed)?|concatenat(?:e|ed)|unique|min|max)_(.+)', pfad[0])
+        if m:
+            return self.bezug_segmente(q, None, m.group(1).split('.') + list(pfad[1:]))
+        if re.match(r'(?:count|countUnique|unique_count|sum|average)_', pfad[0]):
+            return [('dyn', '', '')]
+        return self.offen_oder_fest(q)
+
+    def tabelle_feld(self, q, pfad):
+        """Data Table: Gelesene Zeilen kommen aus der Tabelle, geschriebene Zeilen aus den Werten des Knotens."""
+        p = self.p(q)
+        vorgang = str(p.get('operation') or 'insert')
+        if vorgang in ('insert', 'update', 'upsert'):
+            spalten = p.get('columns') if isinstance(p.get('columns'), dict) else {}
+            werte = spalten.get('value') if isinstance(spalten.get('value'), dict) else {}
+            if spalten.get('mappingMode') == 'defineBelow' and pfad and pfad[0] in werte:
+                wert = werte[pfad[0]]
+                return self.segmente(q, wert, pfad[1:]) if isinstance(wert, str) else [('text', str(wert))]
+            if spalten.get('mappingMode') == 'autoMapInputData':
+                return self.bezug_segmente(q, None, pfad)
+        return [('dyn', '', q)]
+
+    def segmente(self, name, wert, pfad=()):
+        """Zerlegt einen Parameterwert in Teile (siehe oben, bei gewicht). pfad: Feld innerhalb des Werts, wenn der ganze
+        Wert ein einziger Ausdruck ist."""
+        if not isinstance(wert, str):
+            return [('text', '' if wert is None else str(wert))]
+        if not wert.startswith('='):
+            return [('text', wert)]
+        text = wert[1:]
+        alle = list(bloecke(text))
+        if len(alle) == 1 and not text[:alle[0][0]].strip() and not text[alle[0][1]:].strip():
+            return self.ausdruck(name, alle[0][2], None, pfad)
+        teile = []
+        pos = 0
+        for auf, zu, inhalt in alle:
+            if auf > pos:
+                teile.append(('text', text[pos:auf]))
+            teile.extend(self.ausdruck(name, inhalt))
+            pos = zu
+        if pos < len(text):
+            teile.append(('text', text[pos:]))
+        return verdichten(teile)
+
+    # --- Ausdrücke: in Parametern ({{ }}) und im Code-Knoten -----------------------------------------------------------
+    def ausdruck(self, name, code, info=None, pfad=(), kodiert=False, tiefe=0):
+        """Teile des Werts eines JavaScript-Ausdrucks im Knoten name. info: der gelesene Code-Knoten mit seinen lokalen
+        Namen, None in einem Parameter. pfad: Feld innerhalb des Werts, etwa ('pfad',) für ({ pfad: … }).pfad."""
+        code = code.strip()
+        schluessel = (name, code, tuple(pfad), kodiert, info is not None)
+        if schluessel in self._ausdruecke:
+            return self._ausdruecke[schluessel]
+        stand = self.kreise
+        erg = self._ausdruck(name, code, info, tuple(pfad), kodiert, tiefe)
+        if self.kreise == stand:        # nichts Vorläufiges darin: gilt immer
+            self._ausdruecke[schluessel] = erg
+        return erg
+
+    def _ausdruck(self, name, code, info, pfad, kodiert, tiefe):
+        if not code:
+            return [('dyn', '', '')]
+        if tiefe > 40:
+            self.kreise += 1
+            return [('unklar', 'tief', name)]
+        ohne, kern = js_schichten(code)
+        if re.search(r'\$fromAI\s*\(', kern):
+            return [('unklar', 'fromai', name)]
+        if kern[0] in '{[' and passend(kern, 0) == len(kern) - 1:      # ein Objekt oder eine Liste als Ganzes
+            if kern[0] == '{':
+                return self.objekt(name, code[1:-1], info, pfad, tiefe)
+            return self.liste_wert(name, code[1:-1], info, pfad, tiefe)
+        # Rangfolge wie in JavaScript: zuerst a ? b : c, dann || und ??, dann &&, erst danach die Verkettung mit +
+        t = ternaer(ohne, kern)
+        zweige = list(t[1:]) if t else []
+        for zeichen in () if zweige else ('||', '??', '&&'):
+            geteilt = [z for z in teile_oben(ohne, kern, zeichen) if z.strip()]
+            if len(geteilt) > 1:    # a && b ergibt b (oder einen leeren Wert): Davor stehen nur Bedingungen
+                zweige = geteilt[-1:] if zeichen == '&&' else geteilt
+                break
+        if zweige:              # der Wert ist einer der Zweige
+            folgen = [self.ausdruck(name, z, info, pfad, kodiert, tiefe + 1) for z in zweige]
+            if all(f and all(s[0] == 'text' for s in f) for f in folgen):
+                return folgen[0]
+            return maximum(*folgen)
+        summanden = [t for t in teile_oben(ohne, kern, '+') if t.strip()]
+        if len(summanden) > 1:
+            if pfad:            # ein zusammengesetzter Text hat keine Felder
+                return [('dyn', code, '')]
+            teile = []
+            for t in summanden:
+                teile.extend(self.ausdruck(name, t, info, (), kodiert, tiefe + 1))
+            return verdichten(teile)
+        m = TEXTWERT.fullmatch(code)
+        if m:
+            return [('text', m.group(1) if m.group(1) is not None else m.group(2))]
+        if re.fullmatch(r'-?\d+(?:\.\d+)?|true|false|null', code):
+            return [('text', code)]
+        vorlage = vorlage_teile(code)
+        if vorlage is not None:
+            if pfad:
+                return [('dyn', code, '')]
+            teile = []
+            for art, inhalt in vorlage:
+                teile.extend([('text', inhalt)] if art == 'text' else self.ausdruck(name, inhalt, info, (), kodiert, tiefe + 1))
+            return verdichten(teile)
+        if kern.startswith('await') and kern[5:6].isspace():
+            return self.ausdruck(name, ohne[5:], info, pfad, kodiert, tiefe + 1)
+        if info is not None:    # Aufruf einer eigenen Funktion des Code-Knotens: Ihr Wert ist das, was sie zurückgibt
+            m = _AUFRUF.match(kern)
+            rueckgaben = info['funktionen'].get(m.group(1)) if m else None
+            if rueckgaben and passend(kern, m.end() - 1) == len(kern) - 1:
+                def rueckgabe():
+                    folgen = [self.ausdruck(name, r, info, pfad, kodiert, tiefe + 1) for r in rueckgaben]
+                    if all(f and all(s[0] == 'text' for s in f) for f in folgen):
+                        return folgen[0]
+                    return maximum(*folgen)
+                # über _merke: Ruft die Funktion sich selbst auf, bringt der Kreis nichts Neues
+                return self._merke(('funktion', name, m.group(1), kodiert, tuple(pfad)), rueckgabe)
+        seg = self.verkettet(name, ohne, kern, info, pfad, kodiert, tiefe)
+        if seg is None:
+            seg = self.ersetzt(name, ohne, kern, info, pfad, kodiert, tiefe)
+        if seg is not None:
+            return seg
+        innen, kod = huelle_weg(code, locker=info is not None)
+        if innen != code:
+            return self.ausdruck(name, innen, info, pfad, kodiert or kod, tiefe + 1)
+        if info is not None and self.geprueft(info, code):
+            return [('dyn', code, '')]
+        m = BEZUG.fullmatch(code)
+        if m:
+            return self.bezug_segmente(name, knotenname(m), pfad_teile(m.group('pfad')) + list(pfad), kodiert)
+        m = GANZE_EINGABE.fullmatch(code)
+        if m and not (info is not None and code == 'items' and 'items' in info['vars']):
+            if pfad and pfad[0] != 'json':
+                return [('dyn', code, '')]
+            quelle = re.sub(r'\\(.)', r'\1', m.group('n')) if m.group('n') else None
+            return self.bezug_segmente(name, quelle, list(pfad[1:]), kodiert)
+        if info is not None:
+            m = ALIASZUGRIFF.fullmatch(code)
+            if m and m.group(1) in info['vars']:
+                return self.code_var(name, info, m.group(1), tuple(pfad_teile(m.group(2))) + pfad, kodiert)
+            m = LOSE.fullmatch(code)
+            if m:
+                return self.bezug_segmente(name, None, pfad_teile(m.group('pfad')) + list(pfad), kodiert)
+            seg = self.tabelle(name, info, code, kern, pfad, tiefe)
+            if seg is not None:
+                return seg
+        if kern[0] == '{' and passend(kern, 0) == len(kern) - 1:
+            return self.objekt(name, code[1:-1], info, pfad, tiefe)
+        m = re.match(r'Object\s*\.\s*assign\s*\(', kern)
+        if m and passend(kern, m.end() - 1) == len(kern) - 1:
+            return self.objekt(name, code[m.end():-1], info, pfad, tiefe, zuweisung=True)
+        if kern[0] == '[' and passend(kern, 0) == len(kern) - 1:
+            return self.liste_wert(name, code[1:-1], info, pfad, tiefe)
+        return self.zufluss(name, code, info, tiefe)
+
+    def verkettet(self, name, ohne, kern, info, pfad, kodiert, tiefe):
+        """a.concat(b, c) und [a, b, c].join('/') sind Verkettungen wie a + b + c. None, wenn der Ausdruck das nicht ist."""
+        ende = len(kern) - 1
+        if not kern.endswith(')'):
+            return None
+        auf = oeffnend(kern, ende)
+        vor = _VERKETTUNG.search(kern[:auf]) if auf > 0 else None
+        vorn = ohne[:vor.start()].strip() if vor else ''
+        if not vorn:
+            return None
+        angaben = [a for a in teile_oben(ohne[auf + 1:ende], kern[auf + 1:ende], ',') if a.strip()]
+        if vor.group(1) == 'concat':
+            stuecke, trenner = [vorn] + angaben, ''
+            if pfad:            # bei Listen: ein Feld ihrer Elemente
+                return maximum(*(self.ausdruck(name, s, info, pfad, kodiert, tiefe + 1) for s in stuecke))
+        else:
+            vk = js_schichten(vorn)[1]
+            m = TEXTWERT.fullmatch(angaben[0]) if len(angaben) == 1 else None
+            if vk[0] != '[' or passend(vk, 0) != len(vk) - 1 or len(angaben) > 1 or (angaben and not m):
+                return None
+            trenner = (m.group(1) if m.group(1) is not None else m.group(2)) if m else ','
+            stuecke = [e for e in teile_oben(vorn[1:-1], vk[1:-1], ',') if e.strip()]
+            if not stuecke or any(e.strip().startswith('...') for e in stuecke):
+                return None
+            if pfad:            # ein zusammengesetzter Text hat keine Felder
+                return [('dyn', ohne, '')]
+        teile = []
+        for nr, s in enumerate(stuecke):
+            if nr and trenner:
+                teile.append(('text', trenner))
+            teile.extend(self.ausdruck(name, s, info, (), kodiert, tiefe + 1))
+        return verdichten(teile)
+
+    def ersetzt(self, name, ohne, kern, info, pfad, kodiert, tiefe):
+        """vorlage.replace('{ort}', wert): Der Wert steht dort, wo der Platzhalter stand. Ist der eingesetzte Wert fest, bleibt
+        es beim Text davor (so säubert man Eingaben). None, wenn der Ausdruck kein replace ist."""
+        ende = len(kern) - 1
+        if not kern.endswith(')'):
+            return None
+        auf = oeffnend(kern, ende)
+        vor = _ERSETZEN.search(kern[:auf]) if auf > 0 else None
+        if not vor or not ohne[:vor.start()].strip():
+            return None
+        if pfad:                # ein Text hat keine Felder
+            return [('dyn', ohne, '')]
+        vorn = self.ausdruck(name, ohne[:vor.start()], info, (), kodiert, tiefe + 1)
+        angaben = teile_oben(ohne[auf + 1:ende], kern[auf + 1:ende], ',')
+        wert = self.ausdruck(name, angaben[1], info, (), False, tiefe + 1) if len(angaben) == 2 else []
+        if rang(wert)[0] == 0:  # fester oder berechneter Wert ohne Eingabe: Es bleibt beim Text davor
+            return vorn
+        platz, alle, gross = None, vor.group(1) == 'replaceAll', 0
+        m = TEXTWERT.fullmatch(angaben[0])
+        if m:
+            platz = m.group(1) if m.group(1) is not None else m.group(2)
+        else:
+            m = _EINFACHER_REGEX.fullmatch(angaben[0].strip())
+            if m:
+                platz, alle, gross = re.sub(r'\\(.)', r'\1', m.group(1)), 'g' in m.group(2), re.I if 'i' in m.group(2) else 0
+        teile, gefunden = [], False
+        for s in vorn:
+            if s[0] != 'text' or not platz or (gefunden and not alle):
+                teile.append(s)
+                continue
+            stuecke = re.split(re.escape(platz), s[1], maxsplit=0 if alle else 1, flags=gross)
+            gefunden = gefunden or len(stuecke) > 1
+            for nr, stueck in enumerate(stuecke):
+                teile.extend(wert if nr else [])
+                teile.extend([('text', stueck)] if stueck else [])
+        if gefunden:
+            return verdichten(teile)
+        if all(s[0] == 'text' for s in vorn) and platz:        # der Platzhalter kommt im festen Text nicht vor
+            return vorn
+        # Wo der Wert landet, ist nicht zu sehen: Er kann überall stehen, auch im Host einer Adresse
+        felder = eingabe_felder(vorn) + eingabe_felder(wert)
+        if felder:
+            return [('misch', ohne, list(dict.fromkeys(felder)))]
+        return [next((s for s in list(vorn) + list(wert) if s[0] == 'unklar'), None) or
+                next((s for s in list(wert) + list(vorn) if s[0] == 'dyn' and s[2]), ('dyn', ohne, ''))]
+
+    def objekt(self, name, inhalt, info, pfad, tiefe, zuweisung=False):
+        """Wert eines Objekts { a: …, ...b } oder von Object.assign(ziel, b, …) (zuweisung), oder eines Felds darin. Ein
+        Objekt mit eigenen Schlüsseln ist fest gebaut, Werte aus der Eingabe darin machen es zu ('misch'). Kopiert es die
+        ganze Eingabe hinein (...b, Object.assign), ist es ('ganz')."""
+        kern = js_schichten(inhalt)[1]
+        werte, kopien = {}, []
+        for e in teile_oben(inhalt, kern, ','):
+            e = e.strip()
+            if not e:
+                continue
+            if zuweisung or e.startswith('...'):
+                kopien.append(e[3:] if e.startswith('...') else e)
+                continue
+            ke = js_schichten(e)[1]
+            stelle = ende_oben(ke, 0, ':')
+            if stelle < len(ke):
+                schluessel = e[:stelle].strip()
+                if not schluessel.startswith('['):
+                    werte.setdefault(schluessel.strip('\'"`'), []).append(e[stelle + 1:])
+            elif re.fullmatch(r'(?!\d)[\w$]+', e):          # Kurzform { name }
+                werte.setdefault(e, []).append(e)
+        if pfad:
+            if pfad[0] in werte:
+                return maximum(*(self.ausdruck(name, w, info, pfad[1:], False, tiefe + 1) for w in werte[pfad[0]]))
+            folgen = [self.ausdruck(name, k, info, pfad, False, tiefe + 1) for k in kopien]
+            folgen = [f for f in folgen if gewicht(f) >= GEWICHT_UNKLAR]
+            return maximum(*folgen) if folgen else [('dyn', '', '')]
+        felder, offen = [], None
+        for k in kopien:
+            f = self.ausdruck(name, k, info, (), False, tiefe + 1)
+            ganz = nur_eingabe(f)
+            if ganz is not None:
+                return [('ganz', ganz, name)]
+            felder += eingabe_felder(f)
+            offen = offen or nur_unklar(f)
+        for liste_ in werte.values():
+            for w in liste_:
+                felder += eingabe_felder(self.ausdruck(name, w, info, (), False, tiefe + 1))
+        if felder:
+            return [('misch', '{…}', list(dict.fromkeys(felder)))]
+        return [offen] if offen else [('dyn', '{…}', '')]
+
+    def liste_wert(self, name, inhalt, info, pfad, tiefe):
+        """Wert einer Liste [a, b, ...c] oder eines Felds ihrer Elemente."""
+        kern = js_schichten(inhalt)[1]
+        elemente = [e.strip() for e in teile_oben(inhalt, kern, ',') if e.strip()]
+        if not elemente:
+            return [('dyn', '[]', '')]
+        folgen = [self.ausdruck(name, e[3:] if e.startswith('...') else e, info, pfad, False, tiefe + 1) for e in elemente]
+        if pfad:
+            return maximum(*folgen)
+        for e, f in zip(elemente, folgen):
+            if e.startswith('...') and nur_eingabe(f) is not None:
+                return [('ganz', nur_eingabe(f), name)]
+        if all(nur_eingabe(f) is not None for f in folgen):         # [b.task]: Jedes Element kommt als Ganzes aus der Eingabe
+            return [('ganz', nur_eingabe(folgen[0]), name)]
+        return zusammen(folgen, '[…]')
+
+    def tabelle(self, name, info, code, kern, pfad, tiefe):
+        """T[x] mit einer Tabelle T aus dem Code-Knoten (const T = { … } oder [ … ]): einer ihrer Werte. Der Schlüssel x
+        wählt nur aus und fließt nicht ins Ergebnis. None, wenn code keine solche Abfrage ist."""
+        m = re.match(r'((?!\d)[\w$]+)\s*\[', kern)
+        if not m or m.group(1) not in info['vars']:
+            return None
+        zu = passend(kern, m.end() - 1)
+        if zu < 0 or TEXTWERT.fullmatch(code[m.end():zu]) or not re.fullmatch(_SCHL + '*', code[zu + 1:]):
+            return None
+        definitionen = info['vars'][m.group(1)]
+        if len(definitionen) != 1 or definitionen[0][1]:
+            return None
+        quelle = huelle_weg(definitionen[0][0], locker=True)[0]
+        qk = js_schichten(quelle)[1]
+        if not quelle or quelle[0] not in '{[' or passend(qk, 0) != len(qk) - 1:
+            return None
+        innen, ik = quelle[1:-1], qk[1:-1]
+        werte = []
+        for e in teile_oben(innen, ik, ','):
+            if not e.strip():
+                continue
+            if quelle[0] == '{':
+                stelle = ende_oben(js_schichten(e)[1], 0, ':')
+                if stelle >= len(e):
+                    return None
+                e = e[stelle + 1:]
+            werte.append(e)
+        rest = tuple(pfad_teile(code[zu + 1:])) + pfad
+        folgen = [self.ausdruck(name, w, info, rest, False, tiefe + 1) for w in werte]
+        if not folgen:
+            return [('dyn', code, '')]
+        if all(f and all(s[0] == 'text' for s in f) for f in folgen):
+            return folgen[0]
+        return maximum(*folgen)
+
+    @staticmethod
+    def geprueft(info, ausdruck):
+        """Wird der Ausdruck im Code gegen eine Liste geprüft (ERLAUBT.includes(x))? Dann fließt nur Erlaubtes weiter."""
+        a = re.sub(r'\s+', '', ausdruck)
+        return a in info['geprueft_ausdruecke'] or a in info['geprueft']
+
+    def zufluss(self, name, code, info=None, tiefe=0):
+        """Wert eines Ausdrucks, der sich nicht weiter zerlegen lässt: Felder der Eingabe, die ins Ergebnis fließen (nicht
+        nur geprüft werden), als ('misch'); eine offene Herkunft als ('unklar'); sonst ('dyn')."""
+        ohne, kern = js_schichten(code)
+        felder, offen, quelle, fremd = [], None, '', False
+
+        def nimm(seg):
+            nonlocal offen, quelle
+            for s in seg:
+                if s[0] in ('ein', 'ganz'):
+                    felder.append(s[1])
+                elif s[0] == 'misch':
+                    felder.extend(s[2])
+                elif s[0] == 'unklar' and offen is None:
+                    offen = s
+                elif s[0] == 'dyn' and s[2] and not quelle:
+                    quelle = s[2]
+        for m in BEZUG.finditer(ohne):
+            if kern[m.start()] != '$':
+                continue
+            pfad, ende = bezug_lesen(kern, m)
+            if nur_vergleich(kern, m.start(), ende) or (info is not None and self.geprueft(info, ohne[m.start():ende])):
+                continue
+            nimm(self.bezug_segmente(name, knotenname(m), pfad))
+        for m in GANZE_EINGABE.finditer(ohne):
+            if kern[m.start()] == ' ' or re.match(r'\s*(?:\[\s*\d+\s*\]\s*)?\.\s*json\b', kern[m.end():m.end() + 30]):
+                continue
+            if m.group(0) == 'items' and info is not None and 'items' in info['vars']:
+                continue
+            if not nur_vergleich(kern, m.start(), m.end()):
+                quelle_ = re.sub(r'\\(.)', r'\1', m.group('n')) if m.group('n') else None
+                nimm(self.bezug_segmente(name, quelle_, []))
+        if info is not None:
+            for m in LOSE.finditer(ohne):
+                wer = re.match(r'(?!\d)[\w$]+', ohne[m.start():]).group(0)
+                if kern[m.start()] == ' ' or wer in info['vars']:
+                    continue
+                pfad, ende = bezug_lesen(kern, m)
+                if not nur_vergleich(kern, m.start(), ende):
+                    nimm(self.bezug_segmente(name, None, pfad))
+            for m in re.finditer(r'(?<![\w$.])(?!\d)[\w$]+', kern):      # lokale Namen im Ausdruck
+                var = m.group(0)
+                if var not in info['vars']:
+                    # Ein Name ohne Vereinbarung, der als Wert dient (kein Aufruf, kein Schlüssel): Herkunft offen
+                    fremd = fremd or (var not in JS_BEKANNT and var not in info['funktionen']
+                                      and not re.match(r'\s*\(', kern[m.end():m.end() + 8])
+                                      and not ist_schluessel(kern, m.start(), m.end()))
+                    continue
+                if var in info['geprueft'] or ist_schluessel(kern, m.start(), m.end()):
+                    continue
+                weiter = re.match(_SCHL + '*', ohne[m.end():])
+                teile = list(_TEIL.finditer(weiter.group(0)))
+                ende = m.end() + len(weiter.group(0))
+                if teile and re.match(r'\s*\(', kern[ende:ende + 8]):      # eine Methode am Ende ist kein Feld
+                    ende = m.end() + teile[-1].start()
+                    teile.pop()
+                if nur_vergleich(kern, m.start(), ende) or self.geprueft(info, ohne[m.start():ende]):
+                    continue
+                nimm(self.code_var(name, info, var, tuple(t.group(1) or t.group(2) or t.group(3) for t in teile)))
+        if felder:
+            return [('misch', code, list(dict.fromkeys(felder)))]
+        if offen:
+            return [offen]
+        if fremd and not quelle and info['liest']:
+            return self.offen_oder_fest(name, 'code')
+        if not quelle:          # Werte, die ein früherer Schritt oder Lauf abgelegt hat, und Dateien aus dem Aufruf
+            ablage = _ABLAGE.search(kern)
+            if ablage:
+                return self.offen_oder_fest(name, 'datei' if ablage.group(0) == '$binary' else 'speicher')
+        return [('dyn', code, quelle)]
+
+    # --- Code-Knoten: lokale Namen und was er unter welchem Feld weitergibt ---------------------------------------------
+    def code_info(self, name):
+        """Liest das JavaScript eines Code-Knotens: lokale Namen mit ihren Werten, geschriebene Felder, Prüfungen gegen
+        Listen, Rückgaben."""
+        if name in self._code:
+            return self._code[name]
+        info = {'vars': {}, 'schreibt': {}, 'geprueft': set(), 'geprueft_ausdruecke': set(), 'durch': False,
+                'behaelter': [], 'dynamisch': False, 'liest': False, 'ohne': '', 'kern': '', 'werte': {},
+                'funktionen': {}, 'anhang': {}}
+        self._code[name] = info
+        code = self.p(name).get('jsCode')
+        if not isinstance(code, str):
+            return info
+        ohne, kern = js_schichten(code)
+        info['ohne'], info['kern'] = ohne, kern
+        namen = info['vars']
+
+        def neu(var, ausdruck, vorn=()):
+            namen.setdefault(var, []).append((ausdruck, tuple(vorn)))
+
+        def zerlegt(liste_, ausdruck, vorn=()):
+            """{ a, b: c = 1 } bindet a an ausdruck.a und c an ausdruck.b."""
+            for teil in liste_.split(','):
+                schluessel, _, lokal = teil.strip().partition(':')
+                schluessel = schluessel.split('=')[0].strip()
+                lokal = (lokal or schluessel).split('=')[0].strip()
+                if re.fullmatch(r'(?!\d)[\w$]+', lokal) and re.fullmatch(r'(?!\d)[\w$]+', schluessel):
+                    neu(lokal, ausdruck, tuple(vorn) + (schluessel,))
+
+        def binde(teil, ausdruck):
+            """Bindet einen Namen oder ein Muster ({ a, b }, [a, b]) an einen Ausdruck."""
+            teil = teil.strip()
+            if teil[:1] in ('{', '['):
+                zu = passend(teil, 0)
+                innen = teil[1:zu] if zu > 0 else ''
+                if teil[0] == '{':
+                    zerlegt(innen, ausdruck)
+                for t in innen.split(',') if teil[0] == '[' else ():        # [a, b] = …: a und b sind Teile des Werts
+                    t = t.replace('...', '').split('=')[0].strip()
+                    if re.fullmatch(r'(?!\d)[\w$]+', t):
+                        neu(t, ausdruck)
+                return
+            teil = teil.split('=')[0].strip()
+            if re.fullmatch(r'(?!\d)[\w$]+', teil):
+                neu(teil, ausdruck)
+
+        def vereinbart(m, ausdruck):
+            if m.group('eins'):
+                neu(m.group('eins'), ausdruck)
+            elif m.group('viele') is not None:
+                zerlegt(ohne[m.start('viele'):m.end('viele')], ausdruck)
+            else:
+                binde('[' + ohne[m.start('reihe'):m.end('reihe')] + ']', ausdruck)
+
+        for m in VEREINBARUNG.finditer(kern):
+            vereinbart(m, ohne[m.end():anweisungsende(kern, m.end())])
+        for m in NAMENSZUWEISUNG.finditer(kern):
+            if re.search(r'(?:const|let|var)\s+$', kern[max(0, m.start() - 10):m.start()]):
+                continue
+            ausdruck = ohne[m.end():anweisungsende(kern, m.end())]
+            if m.group(2) == '+=':                  # url += …: hängt an, ersetzt nicht
+                namen.setdefault(m.group(1), [])
+                info['anhang'].setdefault(m.group(1), []).append(ausdruck)
+            else:
+                neu(m.group(1), ausdruck)
+        for m in SCHLEIFE.finditer(kern):           # liste.map(x => …): x ist ein Element der Liste
+            vor = empfaenger(ohne, kern, m.start())
+            if not vor:
+                continue
+            teile = teile_oben(m.group('liste') or m.group('eins') or '', m.group('liste') or m.group('eins') or '', ',')
+            art = m.group('art')
+            if art in ('reduce', 'reduceRight'):
+                teile = teile[1:2]
+            elif art in ELEMENTWEISE:
+                teile = teile[:1]
+            for teil in teile:                      # sonst (sort, then, replace …): Alle Parameter hängen am Empfänger
+                binde(teil, vor)
+        for m in re.finditer(r'(?<![\w$.])Array\s*\.\s*from\s*\(', kern):       # Array.from(liste, x => …)
+            zu = passend(kern, m.end() - 1)
+            angaben = teile_oben(ohne[m.end():zu], kern[m.end():zu], ',') if zu > 0 else ()
+            kopf = _PFEIL.match(angaben[1]) if len(angaben) > 1 else None
+            if kopf:
+                liste_ = kopf.group(1) or kopf.group(2) or ''
+                binde(teile_oben(liste_, liste_, ',')[0], angaben[0])
+        for m in re.finditer(r'(?<![\w$.])catch\s*\(\s*((?!\d)[\w$]+)\s*\)', kern):
+            neu(m.group(1), 'undefined')            # der Fehler eines try/catch stammt nicht aus der Eingabe
+        for m in FUER.finditer(kern):               # for (const x of liste)
+            auf = kern.find('(', m.start())
+            zu = passend(kern, auf)
+            if zu < 0:
+                continue
+            vereinbart(m, ohne[m.end():zu])
+        funktionen = {}                           # bauen(b): Der Parameter p von const bauen = (p) => … steht für b
+        for m in FUNKTION.finditer(kern):
+            liste_ = next(g for g in (m.group('p1'), m.group('p2'), m.group('p3'), m.group('p4')) if g is not None)
+            fname = m.group('f1') or m.group('f2')
+            funktionen.setdefault(fname, []).append([p.strip() for p in teile_oben(liste_, liste_, ',')])
+            rueckgaben = info['funktionen'].setdefault(fname, [])      # was die Funktion zurückgibt
+            auf = _NAECHSTES.match(kern, m.end())
+            if auf and auf.group(1) == '{':
+                zu = passend(kern, auf.start(1))
+                for r in re.finditer(r'(?<![\w$.])return\b', kern[auf.start(1):zu]) if zu > 0 else ():
+                    stelle = auf.start(1) + r.end()
+                    rueckgaben.append(ohne[stelle:min(anweisungsende(kern, stelle), zu)])
+            elif m.group('p3') is not None or m.group('p4') is not None:       # (p) => Ausdruck
+                rueckgaben.append(ohne[m.end():anweisungsende(kern, m.end())])
+            info['funktionen'][fname] = [r for r in rueckgaben if r.strip()]
+        for m in re.finditer(r'\.\s*((?!\d)[\w$]+)\s*\(\s*((?!\d)[\w$]+)\s*[,)]', kern):       # liste.map(bauen)
+            vor = empfaenger(ohne, kern, m.start()) if m.group(2) in funktionen else ''
+            for parameter in funktionen.get(m.group(2), []) if vor else []:
+                for p in parameter[1:2] if m.group(1) in ('reduce', 'reduceRight') else parameter[:1]:
+                    binde(p, vor)
+        if funktionen:
+            for c in re.finditer(r'(?<![\w$.])((?!\d)[\w$]+)\s*\(', kern):
+                if c.group(1) not in funktionen or re.search(r'function\s+$', kern[max(0, c.start() - 12):c.start()]):
+                    continue
+                zu = passend(kern, c.end() - 1)
+                if zu < 0:
+                    continue
+                angaben = teile_oben(ohne[c.end():zu], kern[c.end():zu], ',')
+                for parameter in funktionen[c.group(1)]:
+                    for nr, p in enumerate(parameter):
+                        p = p.split('=')[0].strip()
+                        if nr >= len(angaben) or p.startswith('...') or not angaben[nr].strip():
+                            break
+                        if re.fullmatch(r'(?!\d)[\w$]+', p):
+                            neu(p, angaben[nr])
+                        elif p.startswith('{') and p.endswith('}'):
+                            zerlegt(p[1:-1], angaben[nr])
+        for m in re.finditer(r'(?<![\w$.])((?!\d)[\w$]+)\s*\.\s*(?:push|unshift)\s*\(', kern):
+            zu = passend(kern, m.end() - 1)
+            if zu > 0:
+                neu(m.group(1), '[' + ohne[m.end():zu] + ']')
+        for m in re.finditer(r'(?<![\w$.])Object\s*\.\s*assign\s*\(', kern):
+            zu = passend(kern, m.end() - 1)
+            if zu < 0:
+                continue
+            angaben = [a for a in teile_oben(ohne[m.end():zu], kern[m.end():zu], ',') if a.strip()]
+            info['behaelter'] += [(a, ()) for a in angaben]
+            if len(angaben) > 1 and re.fullmatch(r'\s*(?!\d)[\w$]+\s*', angaben[0]):
+                neu(angaben[0].strip(), 'Object.assign({}, ' + ', '.join(angaben[1:]) + ')')
+        for m in SCHREIBEN.finditer(kern):          # aus.website = …, aus.website += …
+            info['schreibt'].setdefault(m.group(1), []).append(
+                (tuple(pfad_teile(ohne[m.start(2):m.end(2)])), ohne[m.end():anweisungsende(kern, m.end())], bool(m.group(3))))
+        for m in re.finditer(r'\.\s*(?:includes|has|indexOf)\s*\(', kern):
+            zu = passend(kern, m.end() - 1)
+            if zu > 0:
+                info['geprueft_ausdruecke'].add(re.sub(r'\s+', '', ohne[m.end():zu]))
+        im = set(re.findall(r'(?<![\w$.])((?!\d)[\w$]+)\s+in\s', kern))     # name in OBJEKT
+        info['geprueft'] = {v for v in namen if v in info['geprueft_ausdruecke'] or v in im}
+        for m in re.finditer(r'(?<![\w$.])return\b', kern):
+            ausdruck = ohne[m.end():anweisungsende(kern, m.end())]
+            if ausdruck.strip():
+                info['behaelter'] += [(ausdruck, ('json',)), (ausdruck, ())]
+        for m in re.finditer(r'(?<![\w$.])json\s*:(?!:)', kern):
+            info['behaelter'].append((ohne[m.end():ende_oben(kern, m.end(), ',;')], ()))
+        for m in re.finditer(r'\.\.\.', kern):
+            info['behaelter'].append((ohne[m.end():ende_oben(kern, m.end(), ',;')], ()))
+        # return $input.all(), return items, return { json: $json } …: die Einträge gehen weiter (ein eigenes „items“ zählt nicht)
+        info['durch'] = any(not (m.group(0).split()[1].startswith('items') and 'items' in namen) for m in DURCH.finditer(kern))
+        info['dynamisch'] = bool(DYNAMISCH.search(kern))
+        info['liest'] = bool(BEZUG.search(ohne) or GANZE_EINGABE.search(ohne) or LOSE.search(ohne) or '$(' in kern)
+        return info
+
+    def code_var(self, name, info, var, pfad=(), kodiert=False):
+        """Wert eines lokalen Namens im Code-Knoten (oder eines Felds darin): aus seinen Definitionen und Zuweisungen."""
+        if var in info['geprueft']:
+            return [('dyn', var, '')]
+        pfad = tuple(pfad)
+        seg = self._merke(('var', name, var, pfad), lambda: self._code_var(name, info, var, pfad))
+        if kodiert:
+            seg = [(s[0], s[1], s[2], True) if s[0] == 'ein' else s for s in seg]
+        return seg
+
+    def mit_anhang(self, name, info, folgen, anhaenge, leer):
+        """Wert aus Zuweisungen (der schwerste zählt) und dem, was mit += angehängt wird: url = 'https://…'; url += '?q=' + q"""
+        basis = maximum(*folgen) if folgen else leer
+        if not anhaenge:
+            return basis
+        teile = list(basis)
+        for a in anhaenge:
+            teile.extend(self.ausdruck(name, a, info))
+        return verdichten(teile)
+
+    def _code_var(self, name, info, var, pfad):
+        folgen, anhaenge = [], []
+        for wpfad, ausdruck, anhang in info['schreibt'].get(var, []):
+            if pfad[:len(wpfad)] != wpfad:
+                continue
+            if not anhang:
+                folgen.append(self.ausdruck(name, ausdruck, info, pfad[len(wpfad):]))
+            elif len(pfad) == len(wpfad):
+                anhaenge.append(ausdruck)
+        for ausdruck, vorn in info['vars'].get(var, []):
+            folgen.append(self.ausdruck(name, ausdruck, info, tuple(vorn) + pfad))
+        if not pfad:        # das ganze Objekt: auch die Felder, die später hineingeschrieben werden
+            folgen += [zusammen([self.ausdruck(name, a, info)], var) for _, a, _ in info['schreibt'].get(var, [])]
+            anhaenge += info['anhang'].get(var, [])
+        return self.mit_anhang(name, info, folgen, anhaenge, [('dyn', var, '')])
+
+    def code_werte(self, info, feld):
+        """Ausdrücke, die der Code unter diesem Feldnamen ablegt: { feld: … }, x.feld = …, x['feld'] = …, { feld }.
+        Was mit x.feld += … angehängt wird, steht als ('+', Ausdruck) in der Liste."""
+        if feld in info['werte']:
+            return info['werte'][feld]
+        ohne, kern = info['ohne'], info['kern']
+        f = re.escape(feld)
+        werte = info['werte'][feld] = []
+        for m in re.finditer(r'(?<![\w$.])(?:' + f + r'|\'' + f + r'\'|"' + f + r'")\s*:(?!:)', ohne):
+            if kern[m.start()] == ' ' or kern[max(0, m.start() - 200):m.start()].rstrip()[-1:] not in ('{', ','):
+                continue
+            werte.append(ohne[m.end():ende_oben(kern, m.end(), ',;')])
+        for m in re.finditer(r'(?<![\w$])(?!\d)[\w$]+(?:\s*\??\.\s*(?!\d)[\w$]+)*\s*(?:\.\s*' + f +
+                             r'|\[\s*[\'"]' + f + r'[\'"]\s*\])\s*(\+?)=(?![=>])', ohne):
+            if kern[m.start()] != ' ':
+                ausdruck = ohne[m.end():anweisungsende(kern, m.end())]
+                werte.append(('+', ausdruck) if m.group(1) else ausdruck)
+        if re.search(r'[{,]\s*' + f + r'\s*[,}]', kern):
+            werte.append(feld)
+        return werte
+
+    def code_feld(self, name, pfad):
+        """Woher das Feld pfad in der Ausgabe eines Code-Knotens kommt."""
+        info = self.code_info(name)
+        pfad = tuple(pfad)
+        if pfad:
+            folgen, anhaenge = [], []
+            for w in self.code_werte(info, pfad[0]):
+                if not isinstance(w, tuple):
+                    folgen.append(self.ausdruck(name, w, info, pfad[1:]))
+                elif len(pfad) == 1:
+                    anhaenge.append(w[1])
+            if folgen or anhaenge:
+                return self.mit_anhang(name, info, folgen, anhaenge, [('dyn', '', '')])
+        if info['durch']:
+            return self.bezug_segmente(name, None, pfad)
+        folgen = []
+        for ausdruck, vorn in info['behaelter']:        # Rückgaben, json: …, ...x, Object.assign(…)
+            f = self.ausdruck(name, ausdruck, info, tuple(vorn) + pfad)
+            if gewicht(f) >= GEWICHT_UNKLAR:
+                folgen.append(f)
+        if folgen:
+            return maximum(*folgen)
+        if info['dynamisch'] and info['liest']:
+            return [('unklar', 'code', name)]
+        return [('dyn', '', '')]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Die Prüfungen
+# ---------------------------------------------------------------------------------------------------------------------
+# Für die Meldung, wenn eine Prüfung scheitert: worum es geht, und was von Hand zu prüfen ist
+PRUEFSCHRITTE = {
+    'weiterleitung': ('offene Weiterleitung und Adressen aus der Eingabe', 'ob Adresse, Pfad, Actor, Modell und Anfrage jedes '
+                      'bezahlten Aufrufs und der Host jeder HTTP-Adresse fest im Workflow stehen'),
+    'zugangsdaten': ('Zugangsdaten im Klartext', 'ob in einem Parameter, im Code oder in einer Notiz ein Schlüssel steht'),
+    'webhooks': ('die Webhook-Einstellungen', 'ob der Pfad mit deinem Kürzel beginnt und responseMode "responseNode" und '
+                 'Allowed Origins gesetzt sind'),
+    'antwortwege': ('die Antwort an die Oberfläche', 'ob jeder Zweig hinter dem Webhook mit „Respond to Webhook“ endet'),
+    'kosten': ('Kosten hinter dem Webhook', 'ob vor jedem bezahlten Aufruf ein Tageszähler steht'),
+    'name': ('den Namen des Workflows', 'ob er mit „buildbar: “ beginnt'),
+    'aktiv': ('den Zustand aktiv', 'ob der Workflow aktiv ist und der gespeicherte Stand läuft'),
+    'ausdruecke': ('Ausdrücke ohne „=“', 'ob jeder Wert mit {{ }} mit „=“ beginnt'),
+    'set_knoten': ('das Format der Set-Knoten', 'ob die Felder unter assignments stehen'),
+    'daten': ('Felder aus dem Schritt davor', 'ob jedes gelesene Feld im Schritt davor vorkommt und Webhook-Daten über .body '
+              'gelesen werden'),
+    'verweise': ('Verweise auf andere Knoten', 'ob jeder Name in $(\'…\') zu einem Knoten passt'),
+    'bausteine': ('die Aufrufe der Bausteine', 'ob jeder Baustein mit mode "each" und source "database" aufgerufen wird'),
+    'verzweigungen': ('IF und Switch', 'ob jeder Ausgang zum richtigen Ziel führt'),
+    'code': ('die Code-Knoten', 'ob dort fetch, $helpers, new URL, $env oder require steht'),
+    'ki': ('die KI-Knoten', 'ob jedes Sprachmodell einen Zugang hat und jede Kette ein Sprachmodell und den passenden Parser'),
+    'zugaenge': ('fehlende Zugänge', 'ob jeder Knoten, der einen Zugang braucht, einen hat'),
+    'leere_ketten': ('leere Ergebnisse', 'ob Knoten, die Daten holen, alwaysOutputData: true haben'),
+    'tabellen': ('die Grenze von 50 Zeilen', 'ob Tabellen mit returnAll: true gelesen werden'),
+    'haengend': ('unverbundene Knoten', 'ob jeder Knoten einen Vorgänger hat'),
+    'notizen': ('Notizen', 'ob Notizen im Workflow stehen'),
+    'knotennamen': ('Knotennamen', 'ob jeder Knoten einen eigenen Namen hat'),
+}
+
+
+class Pruefer:
+    def __init__(self, wf, kuerzel):
+        self.w = wf
+        self.kuerzel = kuerzel
+        self.befunde = []           # (Stufe, Prüfung, Text, wer): gleiche Texte an mehreren Knoten werden eine Zeile
+        self.fremd = False          # der Name beginnt nicht mit „buildbar: “
+        self.abgelegt = abgelegt(wf.name)
+        self.ungeprueft = []        # was sich hier nicht prüfen ließ
+        self.luecken_gemeldet = set()
+        self._luecken = {}
+        self._in_arbeit = set()
+
+    def fehler(self, pruefung, text, wer=None):
+        self.befunde.append(('FEHLER', pruefung, text, wer))
+
+    def hinweis(self, pruefung, text, wer=None):
+        self.befunde.append(('HINWEIS', pruefung, text, wer))
+
+    def namen(self, *arten):
+        """Namen der eingeschalteten Knoten (ohne Notizen), auf Wunsch nur bestimmter Arten."""
+        return [n for n in self.w.knoten if self.w.an(n) and self.w.art(n) != 'stickynote'
+                and (not arten or self.w.art(n) in arten)]
+
+    def codes(self, name):
+        """Alle JavaScript-Stücke eines Knotens: die {{ }} seiner Ausdrücke und der Code eines Code-Knotens."""
+        for pfad, wert, _ in texte(self.w.p(name)):
+            if pfad == 'jsCode' and self.w.art(name) == 'code':
+                yield wert
+            elif wert.startswith('='):
+                yield from (b for _, _, b in bloecke(wert))
+
+    def alles(self):
+        for schritt in (self.name, self.aktiv, self.weiterleitung, self.zugangsdaten, self.webhooks, self.antwortwege,
+                        self.ausdruecke, self.set_knoten, self.daten, self.verweise, self.bausteine, self.verzweigungen,
+                        self.code, self.ki, self.zugaenge, self.kosten, self.leere_ketten, self.tabellen, self.haengend,
+                        self.notizen, self.knotennamen):
+            try:
+                schritt()
+            except Exception as fehler:     # eine Prüfung, die an diesem Workflow scheitert, reißt die anderen nicht mit
+                was, wie = PRUEFSCHRITTE.get(schritt.__name__, (f'„{schritt.__name__}“', 'diesen Punkt'))
+                self.fehler('Prüfung unvollständig', f'Die Prüfung auf {was} ist an diesem Workflow gescheitert '
+                            f'({type(fehler).__name__}, {fehlerstelle(fehler)}). Prüf von Hand, {wie}, und gib diese Zeile '
+                            'der Betreuung weiter.')
+        if self.w.erschoepft:
+            self.fehler('Prüfung unvollständig', 'Der Workflow ist zu verschachtelt, um die Herkunft jedes Werts zu verfolgen. '
+                        'Wo sie offen blieb, steht ein HINWEIS „Herkunft nicht prüfbar“. Prüf dort von Hand, dass Adressen, '
+                        'Pfade und Anfragen fest im Workflow stehen, und gib diese Zeile der Betreuung weiter.')
+        return self
+
+    def herkunft(self, s):
+        """Kurz, woher ein Wert kommt, dessen Herkunft offen ist (für die Klammer in einer Meldung)."""
+        if s[0] == 'dyn':
+            return f'aus {anf(s[2])}'
+        grund, knoten = s[1], s[2]
+        return {
+            'knoten': f'über {anf(knoten)}, dort endet die Verfolgung',
+            'ki': f'aus der Antwort der KI in {anf(knoten)}',
+            'code': f'aus dem Code von {anf(knoten)}, der den Wert nicht nachvollziehbar zusammensetzt',
+            'json': f'aus dem JSON von {anf(knoten)}, das sich nicht lesen lässt',
+            'unterworkflow': f'aus dem Unter-Workflow, den {anf(knoten)} aufruft',
+            'sql': f'aus der SQL-Abfrage in {anf(knoten)}',
+            'fromai': 'von der KI über $fromAI()',
+            'speicher': f'in {anf(knoten)} aus gemerkten Daten (staticData oder customData), ihre Herkunft ist hier nicht zu sehen',
+            'datei': f'in {anf(knoten)} aus einer Datei ($binary), die aus dem Aufruf stammen kann',
+            'tief': 'über zu viele Schritte',
+            'budget': 'der Workflow ist zu verschachtelt für eine vollständige Verfolgung',
+        }.get(grund, 'die Herkunft lässt sich nicht verfolgen')
+
+    # 1 ---------------------------------------------------------------------------------------------------------------
+    def name(self):
+        n = self.w.name
+        if n.startswith(PRAEFIX) and n[len(PRAEFIX):].strip():
+            return
+        self.fremd = True
+        self.fehler('Name', f'Der Workflow heißt {anf(kuerzen(n, 60))} und beginnt nicht mit „buildbar: “. Nur Workflows mit diesem '
+                    'Anfang änderst und testest du. Ist es dein eigener Bau: Bitte die Person, ihn in n8n umzubenennen, oder leg '
+                    'ihn mit name: "buildbar: …" neu an.')
+
+    # 13 --------------------------------------------------------------------------------------------------------------
+    def aktiv(self):
+        roh = self.w.roh
+        ausloeser = self.namen('webhook', 'formtrigger')
+        if self.abgelegt:
+            laeuft = [n for n in self.namen() if 'trigger' in self.w.art(n) or self.w.art(n) in ('webhook', 'cron', 'interval')]
+            if roh.get('active') is True and laeuft:
+                self.fehler('Aktiv', 'Der Name kennzeichnet den Workflow als abgelegt (ALT), er ist aber noch aktiv: Sein Auslöser '
+                            f'{liste(laeuft, 3)} läuft weiter. Abgelegte Fehlversuche bleiben aus: Deaktiviere ihn '
+                            '(deactivateWorkflow). Ist es doch der aktuelle Workflow, gehört „ALT“ nicht in den Namen.')
+            return
+        if 'active' not in roh or roh.get('active') is None:
+            if ausloeser:
+                self.ungeprueft.append('ob der Workflow aktiv ist (steht nicht in der Datei)')
+            return
+        test = all(self.testpfad(n) for n in ausloeser)
+        if not roh.get('active'):
+            if ausloeser and not test:
+                self.fehler('Aktiv', f'Der Workflow ist nicht aktiv, hat aber den Auslöser {liste(ausloeser)}: Die Adresse '
+                            'antwortet so nicht. Aktiviere ihn mit activateWorkflow, bevor du testest.')
+            return
+        entwurf, laeuft = roh.get('versionId'), roh.get('activeVersionId')
+        fassung = roh.get('activeVersion') if isinstance(roh.get('activeVersion'), dict) else {}
+        if entwurf and laeuft and entwurf != laeuft:
+            if 'nodes' in fassung and fassung.get('nodes') == roh.get('nodes') and fassung.get('connections') == roh.get('connections'):
+                return
+            self.fehler('Aktiv', 'Der gespeicherte Stand ist nicht der aktive: Es läuft noch die Fassung vor der letzten '
+                        'Änderung. Ruf activateWorkflow erneut auf und teste danach neu, sonst prüfst du den alten Stand.')
+
+    def pfad(self, name):
+        p = self.w.p(name)
+        wert = p.get('path')
+        if not wert and isinstance(p.get('options'), dict):
+            wert = p['options'].get('path')
+        return str(wert or '').strip().lstrip('/')
+
+    def testpfad(self, name):
+        """Ein Test-Webhook nach der Anleitung: Pfad ‹kürzel›-test oder ‹kürzel›-test-…"""
+        anfang = re.escape(self.kuerzel) if self.kuerzel else '[a-z0-9]+'
+        return bool(re.match(anfang + r'-test(?:-|$)', self.pfad(name).lower()))
+
+    # 5 und 12 --------------------------------------------------------------------------------------------------------
+    def weiterleitung(self):
+        if not self.w.eingaenge:
+            return
+        for name in self.namen():
+            art = self.w.art(name)
+            if art == 'executeworkflow':
+                self.wl_baustein(name)
+            elif art in ('httprequest', 'httprequesttool', 'rssfeedread', 'rssfeedreadtool'):       # alles, was eine Adresse abruft
+                self.wl_http(name)
+            elif MODELL.match(art) or art in KI_DIREKT:
+                self.wl_modell(name)
+            elif art in ('chainllm', 'agent'):
+                self.wl_prompt(name)
+
+    def ueber(self, name, felder=()):
+        """Zusatz, wenn der Wert nicht direkt vom Webhook kommt, sondern über einen Schritt davor (der das Feld liefert)."""
+        davor = [q for q in sorted(self.w.produzenten(name)) if self.w.art(q) not in EINGANG
+                 and (not felder or any(gewicht(self.w.feld(q, (f,))) >= 5 for f in felder))]
+        return f', durchgereicht von {liste(davor, 2)}' if davor else ''
+
+    def wl_baustein(self, name):
+        bid = self.w.baustein(name)
+        if bid not in STEUERFELDER:
+            return
+        pfadfelder, anfragefelder = STEUERFELDER[bid]
+        eingaben = self.w.p(name).get('workflowInputs')
+        eigene, nur_eigene = {}, False
+        if isinstance(eingaben, dict) and eingaben.get('mappingMode') == 'defineBelow' and isinstance(eingaben.get('value'), dict) \
+                and eingaben['value']:
+            eigene, nur_eigene = eingaben['value'], True
+        fest = {'pfad': 'den Pfad', 'actor': 'den Actor', 'anfrage': 'den Aufbau der Anfrage', 'eingabe': 'den Aufbau der Eingabe'}
+        ganz, teil, offen, quellen, zusatz, erweitert = [], [], [], [], '', False
+        for feld in pfadfelder + anfragefelder:
+            if nur_eigene and feld not in eigene:
+                continue
+            seg = self.w.segmente(name, eigene[feld]) if feld in eigene else self.w.bezug_segmente(name, None, [feld])
+            if nur_eingabe(seg) is not None:
+                ganz.append(feld)
+                erweitert = erweitert or any(s[0] == 'ganz' for s in seg)
+            elif feld in pfadfelder and [s for s in seg if (s[0] == 'ein' and not s[3]) or s[0] in ('misch', 'ganz')]:
+                teil.append(feld)
+            else:
+                stelle = next((s for s in seg if s[0] == 'unklar'), None) if feld in pfadfelder else nur_unklar(seg)
+                if stelle:
+                    offen.append((feld, stelle))
+                continue
+            quellen += eingabe_felder(seg)
+            if feld not in eigene:
+                zusatz = self.ueber(name, [f for f in pfadfelder + anfragefelder if f not in eigene])
+        for felder, wie in ((ganz, 'als Ganzes' if erweitert else 'unverändert'), (teil, 'zum Teil')):
+            if felder:
+                self.fehler('Offene Weiterleitung',
+                            f'{anf(name)} gibt dem Baustein {BAUSTEINE[bid]} {"das Feld" if len(felder) == 1 else "die Felder"} '
+                            f'{liste(felder)} {wie} aus der Eingabe weiter ({liste(quellen, 4)}{zusatz}). Wer die Adresse des '
+                            'Webhooks kennt, kann so beliebige Abfragen über den Baustein bezahlen lassen. Schreib '
+                            f'{" und ".join(fest[f] for f in felder)} fest in den Workflow. Aus der Eingabe kommen nur einzelne '
+                            'Werte wie Suchwort oder Ort.')
+        if offen and self.w.erreichbar(name):
+            felder = [f for f, _ in offen]
+            self.hinweis('Herkunft nicht prüfbar',
+                         f'{anf(name)}: Woher {"das Feld" if len(felder) == 1 else "die Felder"} {liste(felder)} für den Baustein '
+                         f'{BAUSTEINE[bid]} {"kommt" if len(felder) == 1 else "kommen"}, lässt sich nicht sicher prüfen '
+                         f'({self.herkunft(offen[0][1])}). Kommt der Wert aus der Eingabe, kann jeder, der die Adresse des Webhooks '
+                         f'kennt, beliebige Abfragen über den Baustein bezahlen lassen. Schreib {" und ".join(fest[f] for f in felder)} '
+                         'fest in den Workflow oder wähle aus einer festen Liste (Switch).')
+
+    def http_bezahlt(self, name):
+        """Ruft der HTTP-Knoten einen Dienst mit Zugang oder einen bekannten bezahlten Dienst auf?"""
+        p = self.w.p(name)
+        if self.w.knoten[name].get('credentials') or p.get('authentication') not in (None, '', 'none'):
+            return True
+        if BEZAHLTE_ADRESSEN.search(str(p.get('url') or '')):
+            return True
+        return any(isinstance(e, dict) and schluesselname(e.get('name') or '') for _, _, e in texte(p.get('headerParameters')))
+
+    def adresse_geprueft(self, name):
+        """Ein Schritt vor diesem Knoten, der die Adresse offenbar prüft: Er weist interne Adressen ab oder lässt nur
+        einen festen Host zu."""
+        for v in self.w.knoten:
+            if v in self.w.vorfahren(name) and self.w.art(v) in ('if', 'switch', 'filter', 'code', 'set'):
+                if any(INTERNE_ADRESSE.search(wert) or FESTER_HOST.search(wert) for _, wert, _ in texte(self.w.p(v))):
+                    return v
+        return ''
+
+    def wl_http(self, name):
+        p = self.w.p(name)
+        bezahlt = self.http_bezahlt(name)
+        oeffentlich = self.w.erreichbar(name)
+        mit_zugang = bool(self.w.knoten[name].get('credentials')) or p.get('authentication') not in (None, '', 'none')
+        seg = self.w.segmente(name, p.get('url')) if isinstance(p.get('url'), str) else []
+        lagen = url_lage(seg)
+        host = [s for s, lage in lagen if lage == 'host' and s[0] in ('ein', 'misch', 'ganz')]
+        host_offen = [s for s, lage in lagen if lage == 'host' and (s[0] == 'unklar' or (s[0] == 'dyn' and s[2]))]
+        pfad = [s for s, lage in lagen if lage == 'pfad' and ((s[0] == 'ein' and not s[3]) or s[0] in ('misch', 'ganz'))]
+        pfad_offen = [s for s, lage in lagen if lage == 'pfad' and s[0] == 'unklar']
+        regel = ('nur http und https, kein localhost, keine Adresse mit 10., 172.16. bis 172.31., 192.168. oder 169.254., '
+                 'keine Adresse ohne Punkt')
+        if host:
+            felder = liste(eingabe_felder(host), 3)
+            pruefer = self.adresse_geprueft(name)
+            # Mit Zugang geht der Schlüssel an jede eingetragene Adresse, auch an einen fremden Server: Dann hilft nur ein fester Host
+            if pruefer:
+                ziel = ('nur einen festen Host durchlässt: Der Knoten schickt deinen Zugang mit' if mit_zugang
+                        else f'nur einen festen Host durchlässt oder alles abweist außer: {regel}')
+                self.hinweis('HTTP', f'{anf(name)} ruft eine Adresse auf, deren Host die Eingabe bestimmt ({felder}). '
+                             f'{anf(pruefer)} prüft sie offenbar vorher. Stell sicher, dass die Prüfung {ziel}.')
+            elif mit_zugang:
+                self.fehler('HTTP', f'{anf(name)} ruft mit deinem Zugang eine Adresse auf, deren Host die Eingabe bestimmt '
+                            f'({felder}). Der Zugang geht so an jede Adresse, die ein Aufrufer einträgt, auch an einen fremden '
+                            'Server. Schreib den Host fest in die Adresse. Aus der Eingabe kommen nur einzelne Werte, im Pfad mit '
+                            'encodeURIComponent().')
+            else:
+                self.fehler('HTTP', f'{anf(name)} ruft eine Adresse auf, deren Host die Eingabe bestimmt ({felder}). So lässt '
+                            'sich n8n auf interne Adressen schicken. Nimm den Baustein „Webseite lesen“ (er weist solche Adressen '
+                            f'ab) oder prüf die Adresse vorher im Workflow: {regel}.')
+        elif host_offen and oeffentlich and not self.adresse_geprueft(name):
+            offen = next((s for s in host_offen if s[0] == 'unklar'), None)
+            if offen:       # die Herkunft endet irgendwo: Sie kann die Eingabe sein
+                self.hinweis('Herkunft nicht prüfbar',
+                             f'{anf(name)} ruft eine Adresse auf, deren Host nicht fest im Knoten steht ({self.herkunft(offen)}). '
+                             'Bestimmt ein Aufrufer ihn mit, lässt sich n8n auf interne Adressen schicken'
+                             + (', und dein Zugang geht mit' if mit_zugang else '') + '. Schreib den Host fest in die Adresse, nimm '
+                             f'für Websites den Baustein „Webseite lesen“ (er weist solche Adressen ab) oder prüf die Adresse vorher: '
+                             f'{regel}.')
+            else:           # die Adresse kommt aus den Daten eines anderen Knotens (Baustein, Dienst, Tabelle)
+                self.hinweis('Herkunft nicht prüfbar',
+                             f'{anf(name)} ruft eine Adresse auf, deren Host nicht fest im Knoten steht ({self.herkunft(host_offen[0])}). '
+                             'Ist es eine fremde Website (etwa die eines Betriebs), nimm den Baustein „Webseite lesen“ (er weist '
+                             f'interne Adressen ab) oder prüf die Adresse vorher: {regel}'
+                             + ('; dein Zugang geht sonst an jede dieser Adressen mit' if mit_zugang else '') + '. Ist es der Link, '
+                             'den ein fester Dienst zurückgibt (etwa auf eine erzeugte Datei), ist es in Ordnung.')
+        if not host and pfad and bezahlt:
+            self.fehler('Offene Weiterleitung',
+                        f'{anf(name)}: Die Eingabe ({liste(eingabe_felder(pfad), 3)}) steuert den Pfad der Adresse und damit '
+                        'den Endpunkt eines Dienstes, den der Knoten mit deinem Zugang aufruft. Wer die Adresse des Webhooks '
+                        'kennt, kann so beliebige Abfragen stellen und bezahlen lassen. Schreib den Endpunkt fest in den Knoten '
+                        'oder wähle ihn aus einer festen Liste (Switch). Ein einzelner Wert im Pfad geht nur mit '
+                        'encodeURIComponent().')
+        elif not host and pfad_offen and bezahlt and oeffentlich:
+            self.hinweis('Herkunft nicht prüfbar',
+                         f'{anf(name)}: Woher der Pfad der Adresse kommt, lässt sich nicht sicher prüfen '
+                         f'({self.herkunft(pfad_offen[0])}). Er steuert den Endpunkt eines Dienstes, den der Knoten mit deinem '
+                         'Zugang aufruft. Schreib den Endpunkt fest in den Knoten oder wähle ihn aus einer festen Liste (Switch).')
+        if not bezahlt:
+            return
+        for schluessel in ('jsonBody', 'body'):
+            urteil = self.koerper(name, p.get(schluessel))
+            if urteil:
+                break
+        else:
+            urteil = None
+            liste_felder = p.get('bodyParameters', {}).get('parameters') if isinstance(p.get('bodyParameters'), dict) else None
+            for e in liste_felder if isinstance(liste_felder, list) else []:
+                if isinstance(e, dict) and re.fullmatch(MODELL_SCHLUESSEL, str(e.get('name') or ''), re.I):
+                    felder = eingabe_felder(self.w.segmente(name, e.get('value')))
+                    if felder:
+                        urteil = ('modell', felder[0])
+        if urteil and urteil[0] == 'ganz':
+            self.fehler('Offene Weiterleitung',
+                        f'{anf(name)} schickt die ganze Anfrage {urteil[2]} aus der Eingabe weiter ({anf(urteil[1])}), an einen '
+                        'Dienst, den der Knoten mit deinem Zugang aufruft. Wer die Adresse des Webhooks kennt, kann so beliebige '
+                        'Abfragen stellen und bezahlen lassen. Bau die Anfrage fest im Knoten auf und setz aus der Eingabe nur '
+                        'einzelne Werte ein.')
+        elif urteil and urteil[0] == 'modell':
+            self.fehler('Offene Weiterleitung',
+                        f'{anf(name)} übernimmt das Modell aus der Eingabe ({anf(urteil[1])}). Jeder Aufrufer kann so ein '
+                        'teureres Modell wählen. Schreib das Modell fest in die Anfrage.')
+        elif urteil and oeffentlich:
+            was = 'die ganze Anfrage' if urteil[0] == 'offen' else 'das Modell'
+            rat = ('Bau die Anfrage fest im Knoten auf und setz aus der Eingabe nur einzelne Werte ein.' if urteil[0] == 'offen'
+                   else 'Schreib das Modell fest in die Anfrage.')
+            self.hinweis('Herkunft nicht prüfbar', f'{anf(name)}: Woher {was} für den bezahlten Dienst kommt, lässt sich nicht '
+                         f'sicher prüfen ({self.herkunft(urteil[1])}). {rat}')
+
+    def koerper(self, name, wert):
+        """Urteil über den Körper einer Anfrage: ('ganz', Feld, wie), wenn die ganze Anfrage aus der Eingabe kommt,
+        ('modell', Feld), wenn das Modell daher kommt, ('offen', Teil) oder ('offen_modell', Teil) bei offener Herkunft."""
+        if not isinstance(wert, str) or not wert.startswith('='):
+            return None
+        seg = self.w.segmente(name, wert)
+        ganz = nur_eingabe(seg)
+        if ganz is not None:
+            return ('ganz', ganz, 'als Ganzes' if any(s[0] == 'ganz' for s in seg) else 'unverändert')
+        offen = nur_unklar(seg)
+        modell_offen = None
+        modelle = []
+        for _, _, code in bloecke(wert):
+            ohne, kern = js_schichten(code)
+            for m in re.finditer(r'\.\.\.', kern):
+                teil = nur_eingabe(self.w.ausdruck(name, ohne[m.end():ende_oben(kern, m.end(), ',;')]))
+                if teil is not None:
+                    return ('ganz', teil, 'als Ganzes')
+            for m in re.finditer(r'(?<![\w$.])["\']?' + MODELL_SCHLUESSEL + r'["\']?\s*:(?!:)', kern, re.I):
+                modelle.append(self.w.ausdruck(name, ohne[m.end():ende_oben(kern, m.end(), ',;')]))
+        for m in re.finditer(r'"' + MODELL_SCHLUESSEL + r'"\s*:\s*"?\s*\{\{(.{0,2000}?)\}\}', wert, re.S | re.I):
+            modelle.append(self.w.ausdruck(name, m.group(1)))
+        for teile in modelle:
+            felder = eingabe_felder(teile)
+            if felder:
+                return ('modell', felder[0])
+            modell_offen = modell_offen or next((s for s in teile if s[0] == 'unklar'), None)
+        if offen:
+            return ('offen', offen)
+        return ('offen_modell', modell_offen) if modell_offen else None
+
+    def wl_modell(self, name):
+        p = self.w.p(name)
+        optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+        for schluessel in ('model', 'modelId', 'modelName'):
+            wert = p.get(schluessel, optionen.get(schluessel))
+            if isinstance(wert, dict):
+                wert = wert.get('value')
+            seg = self.w.segmente(name, wert) if isinstance(wert, str) else []
+            felder = eingabe_felder(seg)
+            if felder:
+                self.fehler('Offene Weiterleitung',
+                            f'{anf(name)} übernimmt das Modell aus der Eingabe ({liste(felder, 3)}). Jeder Aufrufer kann so ein '
+                            'teureres Modell wählen. Schreib das Modell fest in den Knoten.')
+                return
+            stelle = next((s for s in seg if s[0] == 'unklar'), None)
+            if stelle and self.w.erreichbar(name):
+                self.hinweis('Herkunft nicht prüfbar', f'{anf(name)}: Woher das Modell kommt, lässt sich nicht sicher prüfen '
+                             f'({self.herkunft(stelle)}). Schreib das Modell fest in den Knoten.')
+                return
+
+    def wl_prompt(self, name):
+        p = self.w.p(name)
+        art = p.get('promptType')
+        text = p.get('text')
+        if not isinstance(text, str):
+            # n8n speichert Standardwerte nicht: „auto“ ist der Standard und liest chatInput vom Chat-Auslöser
+            if art in (None, '', 'auto'):
+                text = '={{ $json.chatInput }}'
+            elif art == 'guardrails':
+                text = '={{ $json.guardrailsInput }}'
+            else:
+                return
+        seg = self.w.segmente(name, text)
+        feld = nur_eingabe(seg)
+        offen = nur_unklar(seg) if feld is None else None
+        if feld is None and not (offen and self.w.erreichbar(name)):
+            return
+        optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+        nachrichten = p.get('messages', {}).get('messageValues') if isinstance(p.get('messages'), dict) else None
+        feste = [str(optionen.get('systemMessage') or '')]
+        feste += [str(n.get('message') or '') for n in (nachrichten if isinstance(nachrichten, list) else []) if isinstance(n, dict)]
+
+        def traegt(text_):
+            """Eine Systemnachricht zählt, wenn sie festen Text hat oder aus einem anderen Schritt kommt, nicht aus der Eingabe."""
+            teile = self.w.segmente(name, text_)
+            return sum(len(s[1].strip()) for s in teile if s[0] == 'text') >= 20 or any(s[0] == 'dyn' for s in teile)
+        if any(traegt(t) for t in feste):
+            return
+        if feld is not None:
+            self.fehler('Offene Weiterleitung',
+                        f'{anf(name)}: Der Prompt kommt als Ganzes aus der Eingabe ({anf(feld)}), und es gibt keine feste '
+                        'Systemnachricht. Damit ist der öffentliche Eingang ein offener KI-Zugang für jeden, der die Adresse kennt. Schreib die '
+                        'Aufgabe fest in den Prompt oder in die Systemnachricht und setz die Eingabe nur als Wert ein, als Daten '
+                        'gekennzeichnet.')
+        else:
+            self.hinweis('Herkunft nicht prüfbar',
+                         f'{anf(name)}: Der Prompt kommt als Ganzes aus einem Wert, dessen Herkunft sich nicht sicher prüfen lässt '
+                         f'({self.herkunft(offen)}), und es gibt keine feste Systemnachricht. Kommt er aus der Eingabe, ist das ein '
+                         'offener KI-Zugang. Schreib die Aufgabe fest in den Prompt oder in die Systemnachricht.')
+
+    # 12, zweiter Teil -----------------------------------------------------------------------------------------------
+    def zugangsdaten(self):
+        # Alle Knoten, auch Notizen und abgeschaltete: Sie stehen ebenso im Workflow und in seiner Sicherung
+        def muster_in(wert):
+            """Art des Schlüssels, den ein Text nach seinem Aussehen enthält, sonst ''."""
+            for was, muster in SCHLUESSELMUSTER:
+                m = muster.search(wert)
+                if m and (not was.startswith(('ein Bearer', 'ein Basic')) or echt(m.group(0).split(None, 1)[-1])):
+                    return was
+            return ''
+
+        for name in self.w.knoten:
+            funde = []
+            notiz = self.w.art(name) == 'stickynote'
+            for pfad, wert, eltern in texte(self.w.p(name)):
+                stelle = ort(pfad, eltern)
+                feld = eltern.get('name') if isinstance(eltern, dict) and pfad.endswith('.value') else None
+                if isinstance(feld, str) and echt(wert) and (kopfname(feld) if 'header' in pfad.lower() else schluesselname(feld)):
+                    funde.append((f'Feld {anf(feld)}', 'ein fest eingetragener Schlüssel'))
+                    continue
+                was = muster_in(wert)
+                if was:
+                    funde.append((stelle, was))
+                elif any(re.sub(r'[^a-z0-9]', '', m.group(1).lower()).endswith(PAAR_ENDE) and echt(m.group(2))
+                         for m in SCHLUESSELPAAR.finditer(wert)):
+                    funde.append((stelle, 'ein fest eingetragener Schlüssel'))
+                elif notiz and any(re.sub(r'[^a-zäöüß0-9]', '', m.group('n').lower()).endswith(NOTIZ_ENDE) and echt(m.group('w'))
+                                   for m in NOTIZZEILE.finditer(wert)):
+                    funde.append((stelle, 'eine Zeile mit Passwort oder Schlüssel'))
+            if funde:
+                stellen = '; '.join(f'{s}: {w}' for s, w in list(dict.fromkeys(funde))[:3])
+                art = self.w.art(name)
+                wer = f'Notiz {anf(name)}' if art == 'stickynote' else anf(name) + ('' if self.w.an(name) else ' (abgeschaltet)')
+                self.fehler('Zugangsdaten',
+                            'Dort stehen offenbar Zugangsdaten im Klartext. Der Wert wird hier nicht gezeigt. Nimm ihn aus dem '
+                            'Workflow und nutz einen Zugang (Credential) aus dem n8n-Konto. Notizen und abgeschaltete Knoten stehen '
+                            'genauso im Workflow und in seiner Sicherung. Ein Schlüssel, der im Workflow stand, gilt als bekannt: '
+                            'beim Anbieter erneuern lassen.', f'{wer} ({stellen})')
+        # Auch festgehaltene Testdaten (pinData) und gemerkte Daten (staticData) stehen im Workflow und in seiner Sicherung
+        # Dort zählt der Name eines Felds nur bei Kopfzeilen (headers), sonst das Aussehen des Werts: Antworten fremder
+        # Dienste und gemerkte Stände haben oft Felder wie „token“ (Blättermarke, Kennung eines Auftrags), die kein Zugang sind
+        for wo, daten, rat in (
+                ('den festgehaltenen Testdaten (pinData)', self.w.roh.get('pinData'),
+                 'Bitte die Person, die festgehaltenen Daten in n8n am Knoten zu lösen („Unpin“), und teste ohne Schlüssel in der '
+                 'Eingabe.'),
+                ('den gemerkten Daten des Workflows (staticData)', self.w.roh.get('staticData'),
+                 'Dort merkt sich ein Workflow nie Zugangsdaten: Nimm den Wert heraus und nutz einen Zugang (Credential).')):
+            funde = []
+            for pfad, wert, _ in texte(daten):
+                blatt = re.split(r'[.\[\]]+', pfad.strip('.[]'))[-1]
+                if '.headers.' in f'.{pfad}' and kopfname(blatt) and echt(wert):
+                    funde.append(f'Feld {anf(kuerzen(blatt, 40))}: ein fest eingetragener Schlüssel')
+                elif muster_in(wert):
+                    funde.append(muster_in(wert))
+            if funde:
+                self.fehler('Zugangsdaten', f'In {wo} stehen offenbar Zugangsdaten im Klartext ('
+                            f'{"; ".join(list(dict.fromkeys(funde))[:3])}). Der Wert wird hier nicht gezeigt. Sie stehen damit im '
+                            f'Workflow und in seiner Sicherung. {rat} Ein Schlüssel, der dort stand, gilt als bekannt: beim Anbieter '
+                            'erneuern lassen.')
+
+    # 4 ---------------------------------------------------------------------------------------------------------------
+    def webhooks(self):
+        ohne_kuerzel = False
+        for name in self.namen('webhook', 'formtrigger'):
+            art = self.w.art(name)
+            pfad = self.pfad(name)
+            if art == 'formtrigger' and not pfad:
+                continue
+            if not self.kuerzel:
+                ohne_kuerzel = True
+            elif not pfad.lower().startswith(self.kuerzel + '-'):
+                self.fehler('Webhook', f'{anf(name)}: Der Pfad {anf(kuerzen(pfad, 60))} beginnt nicht mit deinem Kürzel und '
+                            'einem Bindestrich (‹kürzel›-name, das Kürzel zeigt buildbar-status). Ein Pfad gilt in der ganzen '
+                            'n8n, auch für andere Konten. Ändere den Pfad und danach die Adresse in der Oberfläche.')
+            if art != 'webhook':
+                continue
+            p = self.w.p(name)
+            test = self.testpfad(name)
+            if test:
+                self.hinweis('Webhook', f'{anf(name)} ist ein Test-Webhook (Pfad ‹kürzel›-test-…). Entferne ihn nach dem Test '
+                             'wieder oder deaktiviere den Test-Workflow.')
+            modus = p.get('responseMode') or 'onReceived'
+            antworten = [n for n in self.namen('respondtowebhook') if n in self.w.nachfahren(name)]
+            if modus in ('onReceived', 'lastNode') and antworten:
+                gesetzt = f'responseMode "{modus}"' if p.get('responseMode') else 'keinen responseMode (dann gilt "onReceived")'
+                (self.hinweis if test else self.fehler)(
+                    'Webhook', f'{anf(name)} hat {gesetzt}, dahinter steht aber {liste(antworten, 3)}. So wird „Respond to '
+                    'Webhook“ nicht benutzt: Die Oberfläche bekommt nicht deine Antwort. Setz am Webhook responseMode: '
+                    '"responseNode".')
+            elif test:
+                pass        # Tests laufen über n8n_test_workflow: sofortige Antwort und CORS spielen dort keine Rolle
+            elif modus == 'onReceived':
+                self.hinweis('Webhook', f'{anf(name)} antwortet sofort mit „Workflow was started“ (responseMode fehlt oder ist '
+                             '"onReceived"), ohne Ergebnis. Soll die Oberfläche ein Ergebnis bekommen: responseMode: '
+                             '"responseNode" und am Ende „Respond to Webhook“.')
+            elif modus == 'lastNode':
+                self.hinweis('Webhook', f'{anf(name)} antwortet mit dem letzten Knoten (responseMode "lastNode"). Vereinbart ist '
+                             '"responseNode" mit „Respond to Webhook“: Nur so legst du Antwort und Fehlerfall selbst fest.')
+            optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+            if not test and not str(optionen.get('allowedOrigins') or '').strip():
+                self.hinweis('Webhook', f'{anf(name)}: „Allowed Origins (CORS)“ ist nicht gesetzt. Ruft die Oberfläche diesen '
+                             'Webhook auf, setz options.allowedOrigins auf "*".')
+        if ohne_kuerzel:
+            self.ungeprueft.append('ob der Webhook-Pfad mit dem Kürzel beginnt (das Kürzel ist hier nicht bekannt, '
+                                   'buildbar-status zeigt es)')
+
+    def luecken(self, name):
+        """Stellen ab diesem Knoten, an denen ein Weg ohne „Respond to Webhook“ endet. Leer: Jeder Weg antwortet."""
+        if name in self._luecken:
+            return self._luecken[name]
+        if name in self._in_arbeit:
+            return []
+        art = self.w.art(name)
+        if art == 'respondtowebhook' and self.w.an(name):
+            return []
+        self._in_arbeit.add(name)
+        ausg = self.w.aus.get(name) or []
+        if art in ('if', 'switch') and self.w.an(name):
+            anzahl = self.w.ausgaenge(name)
+            fehler_nr = self.w.fehler_nr(name)
+            erg = []
+            for nr in range(anzahl if anzahl is not None else len(ausg)):
+                ziele = [z for z, _ in ausg[nr]] if nr < len(ausg) else []
+                if not ziele:
+                    if anzahl is not None and nr != fehler_nr:
+                        erg.append((name, nr))
+                    continue
+                teile = [self.luecken(z) for z in ziele]
+                if all(teile):
+                    erg.extend(min(teile, key=len))
+        else:
+            ziele = [z for a in ausg for z, _ in a]
+            teile = [self.luecken(z) for z in ziele]
+            erg = [(name, None)] if not ziele else ([] if not all(teile) else list(min(teile, key=len)))
+        self._in_arbeit.discard(name)
+        self._luecken[name] = erg
+        return erg
+
+    def antwortwege(self):
+        for name in self.namen('webhook'):
+            if self.w.p(name).get('responseMode') != 'responseNode':
+                continue
+            # Ein Test-Webhook ist genauso öffentlich, aber nur kurz in Betrieb: dort als HINWEIS
+            melden = self.hinweis if self.testpfad(name) else self.fehler
+            if not [n for n in self.namen('respondtowebhook') if n in self.w.nachfahren(name)]:
+                melden('Webhook', f'{anf(name)} wartet auf „Respond to Webhook“ (responseMode "responseNode"), aber von dort aus '
+                       'ist kein solcher Knoten erreichbar: Der Aufruf bekommt keine Antwort. Häng an das Ende jedes Zweigs '
+                       'einen „Respond to Webhook“.')
+                continue
+            je_knoten = {}
+            for knoten, nr in self.luecken(name):
+                if (knoten, nr) not in self.luecken_gemeldet:
+                    self.luecken_gemeldet.add((knoten, nr))
+                    je_knoten.setdefault(knoten, []).append(nr)
+            andere = [n for n in self.namen() if n != name and ('trigger' in self.w.art(n) or self.w.art(n) == 'webhook')
+                      and self.w.p(n).get('responseMode') != 'responseNode']
+            for knoten, nummern in list(je_knoten.items())[:4]:
+                auch = [a for a in andere if knoten in self.w.nachfahren(a)]
+                if auch:
+                    self.hinweis('Antwort fehlt', f'Der Weg über {anf(knoten)} endet ohne „Respond to Webhook“. Er gehört auch zum '
+                                 f'Auslöser {liste(auch, 2)}: Ist er nur für diesen gedacht, ist es in Ordnung. Kann ein Aufruf von '
+                                 f'{anf(name)} dort ankommen, bekommt die Oberfläche keine Antwort.')
+                    continue
+                if nummern == [None]:
+                    melden('Antwort fehlt', f'Der Weg über {anf(knoten)} endet ohne „Respond to Webhook“. Kommt ein Aufruf dort '
+                           'an, bekommt die Oberfläche keine Antwort. Häng dort einen „Respond to Webhook“ an.')
+                    continue
+                art = self.w.art(knoten)
+                if art == 'if':
+                    wo = f'Der Ausgang „{self.w.ausgang_name(knoten, nummern[0])}“ führt'
+                    wie = 'branch: "true"' if nummern[0] == 0 else 'branch: "false"'
+                elif len(nummern) == 1:
+                    wo, wie = f'Der Ausgang {self.w.ausgang_name(knoten, nummern[0])} führt', f'case: {nummern[0]}'
+                else:
+                    namen = [self.w.ausgang_name(knoten, nr) for nr in nummern]
+                    wo = 'Die Ausgänge ' + ', '.join(namen[:-1]) + ' und ' + namen[-1] + ' führen'
+                    wie = 'case: ' + ', '.join(str(nr) for nr in nummern)
+                text = (f'{anf(knoten)}: {wo} ins Leere. Kommt ein Aufruf dort an, bekommt die Oberfläche keine Antwort. Häng dort '
+                        f'„Respond to Webhook“ an ({wie}).')
+                erste = self.w.ziele(knoten, 0)
+                if 0 not in nummern and len(erste) >= 2:
+                    text += (f' Am ersten Ausgang hängen {len(erste)} Ziele ({liste(erste, 3)}): Verdacht auf fehlendes '
+                             f'{"branch" if art == "if" else "case"} bei diesen Verbindungen.')
+                melden('Antwort fehlt', text)
+
+    # 2 ---------------------------------------------------------------------------------------------------------------
+    def selbst_aufgeloest(self, name, pfad):
+        """Ein Feld, in dem der Knoten {{ }} selbst einsetzt (HTML-Vorlage, SQL-Abfrage): Dort fehlt kein „=“."""
+        if re.fullmatch(r'formFields\.values\[\d+\]\.html', pfad):
+            return True         # HTML-Baustein eines Formulars (Form, Wait, „Senden und auf Antwort warten“ bei Mail, Slack …)
+        art = re.sub(r'tool$', '', self.w.art(name))
+        blatt = re.split(r'[.\[\]]+', pfad.strip('.[]'))[-1]
+        if blatt not in SELBST_AUFGELOEST.get(art, ()):
+            return False
+        return art != 'html' or str(self.w.p(name).get('operation') or 'generateHtmlTemplate') == 'generateHtmlTemplate'
+
+    def ausdruecke(self):
+        for name in self.namen():
+            sicher, unklar, env = [], [], False
+            for pfad, wert, eltern in texte(self.w.p(name)):
+                if pfad in ('jsCode', 'pythonCode'):
+                    continue
+                inhalte = [b for _, _, b in bloecke(wert)]
+                if wert.startswith('='):
+                    env = env or any(ENV.search(js_schichten(b)[1]) for b in inhalte)
+                elif inhalte and not self.selbst_aufgeloest(name, pfad):
+                    eintrag = ort(pfad, eltern) + ': {{ ' + kuerzen(inhalte[0][:200], 40) + ' }}'
+                    (sicher if any(N8N_AUSDRUCK.search(b) for b in inhalte) else unklar).append(eintrag)
+            if sicher:
+                stellen = '; '.join(sicher[:3]) + (f' und {len(sicher) - 3} weitere' if len(sicher) > 3 else '')
+                self.fehler('Ausdruck ohne =', 'Der Wert enthält {{ }}, beginnt aber nicht mit „=“. n8n rechnet das nicht aus, der '
+                            'Text geht wörtlich durch (auch in einem Prompt), und die Prüfung von n8n meldet nichts. Setz „=“ an '
+                            'den Anfang des Werts.', f'{anf(name)} ({stellen})')
+            elif unklar:
+                self.hinweis('Ausdruck ohne =', 'Der Wert enthält {{ }} ohne „=“ am Anfang. Soll n8n das ausrechnen, fehlt das „=“. '
+                             'Ist es der Platzhalter eines anderen Dienstes, ist es in Ordnung.', f'{anf(name)} ({unklar[0]})')
+            if env:
+                self.fehler('Ausdruck', 'Dort wird $env gelesen. Umgebungsvariablen liest ein Workflow hier nie: Nimm einen '
+                            'festen Wert oder einen Zugang (Credential).', anf(name))
+
+    # 3 ---------------------------------------------------------------------------------------------------------------
+    def set_knoten(self):
+        for name in self.namen('set'):
+            p = self.w.p(name)
+            v = self.w.version(name)
+            if v < 3 or p.get('mode', 'manual') != 'manual':
+                continue
+            neu = bool(p.get('assignments', {}).get('assignments')) if isinstance(p.get('assignments'), dict) else False
+            alt = bool(p.get('fields', {}).get('values')) if isinstance(p.get('fields'), dict) else False
+            alt = alt or bool(p.get('values'))
+            wer = f'{anf(name)} (typeVersion {self.w.knoten[name].get("typeVersion")})'
+            if v >= 3.3 and not neu and alt:
+                self.fehler('Set-Format', 'Die Felder stehen im alten Format (fields.values). Die Prüfung von n8n nimmt das an, '
+                            'der Knoten setzt die Felder aber nicht und liefert still leere Einträge {}. Schreib sie unter '
+                            'assignments: {"assignments": [{"id": "f1", "name": "…", "value": "…", "type": "string"}]}.', wer)
+            elif v >= 3.3 and not neu and p.get('includeOtherFields') is not True:
+                self.hinweis('Set-Format', 'Keine Felder, und nichts wird durchgereicht. Der Knoten liefert leere Einträge {}. '
+                             'Trag die Felder unter assignments ein oder nimm den Knoten heraus.', anf(name))
+            elif v < 3.3 and neu and not alt:
+                self.fehler('Set-Format', 'Die Felder stehen unter assignments. Diese Fassung des Knotens liest nur fields.values '
+                            'und setzt die Felder still nicht. Setz typeVersion auf 3.4.', wer)
+
+    # Daten: .body hinter dem Webhook, Felder hinter einem Set- oder Datumsknoten -----------------------------------
+    def geliefert(self, q):
+        """(Felder, Rat), wenn genau bekannt ist, welche Felder Knoten q liefert, sonst None."""
+        art = self.w.art(q)
+        p = self.w.p(q)
+        if art == 'set' and self.w.version(q) >= 3.3 and p.get('includeOtherFields') is not True:
+            felder = self.w.set_felder(q)
+            if felder:
+                return {f.split('.')[0] for f in felder}, f'Nimm das Feld in {anf(q)} auf'
+        if art == 'datetime' and self.w.version(q) >= 2:
+            optionen = p.get('options') if isinstance(p.get('options'), dict) else {}
+            if optionen.get('includeInputFields') is not True:
+                ziel = str(p.get('outputFieldName') or DATUM_FELD.get(str(p.get('operation') or 'getCurrentDate'), 'newDate'))
+                return {ziel}, f'Setz in {anf(q)} options.includeInputFields: true'
+        return None
+
+    def daten(self):
+        for name in self.namen():
+            ohne_body, fehlt, mit_body, auch_benannt = [], {}, set(), set()
+            for code in self.codes(name):
+                ohne, kern = js_schichten(code)
+                treffer, geschrieben = [], set()
+                for m in BEZUG.finditer(ohne):
+                    if kern[m.start()] != '$':
+                        continue
+                    pfad, ende = bezug_lesen(kern, m)
+                    if ZUWEISUNG.match(kern, ende):         # $json.feld = …: schreibt, liest nicht
+                        if pfad:
+                            geschrieben.add(pfad[0])
+                        continue
+                    if _LOESCHEN.search(kern[max(0, m.start() - 12):m.start()]):       # delete $json.feld: liest auch nicht
+                        continue
+                    treffer.append((m, pfad))
+                for m in LOSE.finditer(ohne):
+                    pfad, ende = bezug_lesen(kern, m)
+                    if pfad and kern[m.start()] != ' ' and ZUWEISUNG.match(kern, ende):
+                        geschrieben.add(pfad[0])
+                if self.w.art(name) == 'code':      # const b = $json.body; … b.x: liest x unter .body
+                    info = self.w.code_info(name)
+                    for var, definitionen in info['vars'].items():
+                        if any('$json' in a and ('body' in a or 'query' in a) and len(a) < 300 and
+                               re.fullmatch(r'\$json\s*\??\.\s*(?:body|query)', huelle_weg(a, locker=True)[0]) for a, _ in definitionen):
+                            mit_body.update(re.findall(r'(?<![\w$.])' + re.escape(var) + r'\s*\??\.\s*((?!\d)[\w$]+)', kern))
+                for m, pfad in treffer:
+                    if len(pfad) > 1 and pfad[0] in ('body', 'query', 'params'):
+                        mit_body.add(pfad[1])
+                    quelle = knotenname(m)
+                    if not pfad or (quelle and quelle not in self.w.gleichnamig) or pfad[0] in geschrieben:
+                        continue
+                    if quelle:
+                        auch_benannt.add(pfad[0])
+                        quellen = set()
+                        for s in self.w.gleichnamig[quelle]:
+                            quellen |= self.w.hinter(s)
+                    else:
+                        quellen = self.w.produzenten(name)
+                    if len(quellen) != 1:
+                        continue
+                    q = next(iter(quellen))
+                    if self.w.art(q) == 'webhook' and pfad[0] not in WEBHOOK_FELDER:
+                        ohne_body.append(pfad[0])
+                        continue
+                    geliefert = self.geliefert(q)
+                    if geliefert and pfad[0] not in geliefert[0]:
+                        fehlt.setdefault((q, bool(quelle)), []).append(pfad[0])
+            ohne_body = [f for f in ohne_body if f not in mit_body]      # „erst body.x, sonst x“ ist nur eine Absicherung
+            if ohne_body:
+                self.fehler('Webhook-Daten', f'{anf(name)} liest vom Webhook {liste(ohne_body, 4)} ohne .body. Die Daten eines '
+                            f'Webhooks liegen unter .body, also $json.body.{ohne_body[0]} (bei GET unter .query). So wie es da '
+                            'steht, ist der Wert still leer.')
+            for (q, benannt), felder in fehlt.items():
+                felder = [f for f in felder if benannt or f not in auch_benannt]
+                if not felder:
+                    continue
+                vorhanden, rat = self.geliefert(q)
+                hat = liste(sorted(vorhanden), 8)
+                if benannt:
+                    self.fehler('Feld fehlt', f'{anf(name)} liest aus {anf(q)} {liste(felder, 4)}. Das gibt es dort nicht: {anf(q)} '
+                                f'liefert nur {hat}. Der Wert ist still leer. {rat} oder lies es aus dem Schritt, der es hat.')
+                else:
+                    self.fehler('Feld fehlt', f'{anf(name)} liest {liste(felder, 4)}, der Schritt davor ({anf(q)}) liefert aber nur '
+                                f'{hat}. $json enthält nur die Daten des direkten Vorgängers: Der Wert ist still leer. {rat} oder '
+                                'hol es mit $(\'Name des Schritts\').item.json.feld.')
+
+    def verweise(self):
+        for name in self.namen():
+            unbekannt = []
+            for code in self.codes(name):
+                ohne, kern = js_schichten(code)
+                for m in VERWEIS.finditer(ohne):
+                    ziel = re.sub(r'\\(.)', r'\1', m.group('a') or m.group('b'))
+                    if kern[m.start()] == '$' and ziel not in self.w.gleichnamig and '${' not in ziel:
+                        unbekannt.append(ziel)
+            for ziel in dict.fromkeys(unbekannt):
+                import difflib
+                nah = difflib.get_close_matches(ziel, list(self.w.gleichnamig), 1, 0.6)
+                self.fehler('Verweis', f'{anf(name)} verweist auf den Knoten {anf(kuerzen(ziel, 50))}, den es im Workflow nicht '
+                            'gibt (umbenannt oder verschrieben, Groß- und Kleinschreibung zählt). Der Ausdruck scheitert beim '
+                            'Lauf.' + (f' Gemeint ist vermutlich {anf(nah[0])}.' if nah else ''))
+
+    # 7 ---------------------------------------------------------------------------------------------------------------
+    def bausteine(self):
+        for name in self.namen('executeworkflow'):
+            bid = self.w.baustein(name)
+            if not bid:
+                continue
+            p = self.w.p(name)
+            wer = f'{anf(name)} (Baustein {BAUSTEINE[bid]})'
+            if p.get('mode') != 'each':
+                self.fehler('Baustein', 'Aufruf ohne mode: "each". Bei mehreren Einträgen verarbeitet der Baustein dann still nur '
+                            'den ersten. Setz mode: "each".', wer)
+            if p.get('source') not in (None, '', 'database'):
+                self.fehler('Baustein', f'Aufruf mit source: "{kuerzen(p.get("source"), 20)}". Bausteine liegen in n8n: Setz '
+                            'source: "database".', wer)
+            elif not p.get('source'):
+                self.hinweis('Baustein', 'source ist nicht gesetzt. n8n nimmt dann "database", in der Anleitung steht es '
+                             'ausdrücklich: Setz source: "database".', wer)
+
+    # 8 ---------------------------------------------------------------------------------------------------------------
+    def verzweigungen(self):
+        for name in self.namen('if', 'switch'):
+            art = self.w.art(name)
+            ausg = self.w.aus.get(name) or []
+            fehler_nr = self.w.fehler_nr(name)
+            belegt = [nr for nr in range(len(ausg)) if ausg[nr] and nr != fehler_nr]
+            anzahl = self.w.ausgaenge(name)
+            regulaer = anzahl - (1 if fehler_nr is not None else 0) if anzahl is not None else None
+            wort = 'branch' if art == 'if' else 'case'
+            doppelt = {}
+            for nr in belegt:
+                for ziel in set(ausg[nr]):
+                    doppelt.setdefault(ziel, []).append(nr)
+            doppelt = {z: nrn for z, nrn in doppelt.items() if len(nrn) > 1}
+            if doppelt and art == 'if':
+                ziel = next(iter(doppelt))[0]
+                self.fehler('IF', f'{anf(name)}: Beide Ausgänge führen zu {anf(ziel)}. Die Bedingung hat so keine Wirkung, alles '
+                            'läuft denselben Weg. Entferne eine der beiden Verbindungen und leg sie mit dem richtigen branch '
+                            '("true" oder "false") zum richtigen Ziel neu an.')
+            elif doppelt and regulaer and any(len(nrn) == regulaer for nrn in doppelt.values()):
+                ziel = next(z for z, nrn in doppelt.items() if len(nrn) == regulaer)
+                self.hinweis('Switch', f'{anf(name)}: Alle {regulaer} Ausgänge führen zu {anf(ziel[0])}. Der Switch hat so keine '
+                             'Wirkung. Ist das gewollt, ist es in Ordnung. Sonst fehlt bei den Verbindungen das richtige Ziel.')
+            if anzahl is not None and art == 'switch':
+                for nr in [n for n in range(len(ausg)) if ausg[n] and n >= anzahl]:
+                    self.fehler('Switch', f'{anf(name)} hat {anzahl} Ausgänge (0 bis {anzahl - 1}), an Ausgang {nr} hängt aber '
+                                f'{liste([z for z, _ in ausg[nr]], 3)}. Diese Verbindung läuft nie. Leg sie mit dem richtigen '
+                                'case neu an oder ergänz die fehlende Regel.')
+            leer = [nr for nr in range(regulaer or 0) if nr not in belegt and (name, nr) not in self.luecken_gemeldet]
+            if not belegt:
+                if leer:
+                    self.hinweis('IF' if art == 'if' else 'Switch', 'Kein Ausgang hat ein Ziel: Hier endet der Weg, und was die '
+                                 'Bedingung ergibt, bleibt ohne Folgen. Häng die Ziele an oder nimm den Knoten heraus.', anf(name))
+                continue
+            erste = [z for z, _ in ausg[0]] if ausg else []
+            if belegt == [0] and len(erste) >= 2 and (regulaer or 2) >= 2:
+                if any((name, nr) in self.luecken_gemeldet for nr in range(1, regulaer or 2)):
+                    continue
+                if art == 'if':
+                    self.hinweis('IF', f'{anf(name)}: {"Beide" if len(erste) == 2 else f"Alle {len(erste)}"} Ziele ({liste(erste, 3)}) '
+                                 'hängen am Ausgang „wahr“, der Ausgang „falsch“ ist leer. Verdacht auf fehlendes branch: Soll eines '
+                                 'davon bei „falsch“ laufen, entferne diese Verbindung und leg sie mit branch: "false" neu an. Ist es '
+                                 'so gewollt, ist es in Ordnung.')
+                else:
+                    self.hinweis('Switch', f'{anf(name)}: Alle {len(erste)} Ziele ({liste(erste, 3)}) hängen am ersten Ausgang, die '
+                                 'übrigen Ausgänge sind leer. Verdacht auf fehlendes case: Entferne die Verbindungen und leg jede mit '
+                                 'ihrem case neu an (case: 0, case: 1 und so weiter).')
+            elif leer:
+                namen = ', '.join(self.w.ausgang_name(name, nr) for nr in leer)
+                self.hinweis('IF' if art == 'if' else 'Switch',
+                             f'{anf(name)}: Ausgang {namen} führt ins Leere. Einträge, die dort landen, verschwinden ohne Meldung. '
+                             f'Ist das gewollt, ist es in Ordnung. Sonst fehlt ein Ziel oder das richtige {wort}.')
+
+    # 10 --------------------------------------------------------------------------------------------------------------
+    def code(self):
+        for name in self.namen('code'):
+            p = self.w.p(name)
+            sprache = str(p.get('language') or 'javaScript').lower()
+            if sprache.startswith('python') or (p.get('pythonCode') and not p.get('jsCode')):
+                self.fehler('Code', 'In Python geschrieben. Code-Knoten laufen hier nur in JavaScript: Schreib den Knoten mit '
+                            'language: "javaScript" und jsCode neu.', anf(name))
+                continue
+            ohne, kern = js_schichten(str(p.get('jsCode') or ''))
+            funde = []
+            if re.search(r'(?<![\w$.])fetch\s*\(', kern):
+                funde.append('fetch')
+            if re.search(r'(?<![\w$])(?:\$|this\s*\.\s*)?helpers\s*\.\s*(?:httpRequest|request)', kern):
+                funde.append('$helpers.httpRequest')
+            if re.search(r'(?<![\w$.])new\s+URL\s*\(', kern):
+                funde.append('new URL')
+            if ENV.search(kern):
+                funde.append('$env')
+            if re.search(r'(?<![\w$.])require\s*\(', kern):
+                funde.append('require')
+            if funde:
+                self.fehler('Code', 'Im Code-Knoten gibt es das hier nicht. Der Knoten bricht ab, oder ein try/catch schluckt den '
+                            'Fehler und das Ergebnis ist still falsch. HTTP geht nur über den Knoten „HTTP Request“, den Host '
+                            'einer Adresse liest du per Regex, Umgebungsvariablen und Zusatzpakete gibt es nicht.',
+                            f'{anf(name)} (nutzt {", ".join(funde)})')
+            m = re.search(r'\{\{\s*[^{}]*?\$(?:json|input|node|\()[^{}]*\}\}', ohne)
+            if m:
+                self.fehler('Code', 'Die Schreibweise mit {{ }} gilt nur in Parametern, im Code-Knoten bleibt sie wörtlicher Text. '
+                            'Schreib dort $json.feld ohne Klammern.', f'{anf(name)} (im Code steht {kuerzen(m.group(0), 40)})')
+
+    # 11 --------------------------------------------------------------------------------------------------------------
+    def ki(self):
+        falsch_verbunden = set()
+        for name in self.namen():
+            art = self.w.art(name)
+            if not (MODELL.match(art) or art in KI_DIREKT):
+                continue
+            if not self.w.knoten[name].get('credentials'):
+                self.fehler('KI', 'Kein Zugang (credentials fehlt). Die Prüfung von n8n meldet das nicht, der Lauf scheitert erst '
+                            'beim Aufruf. Setz einen gemerkten Zugang ein (buildbar-status) oder bitte die Person, ihn im Knoten '
+                            'auszuwählen und zu speichern, danach buildbar-merken aus-workflow <Workflow-ID>.', anf(name))
+            ziele = self.w.ziele(name)
+            if MODELL.match(art) and ziele:
+                falsch_verbunden.update(ziele)
+                self.fehler('KI', f'{anf(name)} hängt über „main“ an {liste(ziele, 3)}. Ein Sprachmodell gehört an den Eingang '
+                            'ai_languageModel: Entferne die Verbindung und leg sie mit sourceOutput: "ai_languageModel" neu an '
+                            '(nicht mit sourcePort).')
+        for name in self.namen(*KETTEN):
+            art = self.w.art(name)
+            p = self.w.p(name)
+            modelle = [q for q, a in self.w.ki_ein[name] if a == 'ai_languageModel' and self.w.an(q)]
+            if not modelle and name not in falsch_verbunden:
+                self.fehler('KI', f'{anf(name)} hat kein angeschlossenes Sprachmodell (der Eingang ai_languageModel ist leer). Häng '
+                            'das „one.intelligence Chat Model“ mit sourceOutput: "ai_languageModel" an.')
+            if art in ('chainllm', 'agent'):
+                parser = [q for q, a in self.w.ki_ein[name] if a == 'ai_outputParser' and self.w.an(q)]
+                verlangt = p.get('hasOutputParser') is True
+                if parser and not verlangt:
+                    self.fehler('KI', f'An {anf(name)} hängt der Parser {anf(parser[0])}, aber hasOutputParser ist nicht true. Der '
+                                'Parser wird still übergangen: Die Antwort kommt als Text statt als JSON, und $json.output fehlt '
+                                'danach. Setz hasOutputParser: true.')
+                elif verlangt and not parser:
+                    self.fehler('KI', f'{anf(name)} verlangt ein festes Format (hasOutputParser: true), aber es hängt kein Parser '
+                                'daran. Häng einen „Structured Output Parser“ mit sourceOutput: "ai_outputParser" an.')
+            wort = self.rechnet(p)
+            if wort:
+                self.hinweis('KI rechnet', f'Der Prompt von {anf(name)} verlangt offenbar Rechnen ({anf(wort)}). Zahlen rechnet '
+                             'n8n, nie die KI: Lass n8n zählen, summieren und Prozente rechnen (Summarize- oder Code-Knoten) und gib '
+                             'der KI nur das Ergebnis zum Formulieren.')
+
+    def rechnet(self, parameter):
+        """Das Wort, an dem zu sehen ist, dass ein Prompt Rechnen verlangt, sonst ''."""
+        for _, wert, _ in texte(parameter):
+            if len(wert) < 20:
+                continue
+            ohne_bloecke, stelle = '', 0
+            for auf, zu, _ in bloecke(wert):
+                ohne_bloecke += wert[stelle:auf] + ' {{}} '
+                stelle = zu
+            for satz in re.split(r'(?<=[.!?])\s+|\n', ohne_bloecke + wert[stelle:]):
+                if VERNEINT.search(satz):
+                    continue
+                m = RECHEN_VERB.search(satz)
+                if m and not (m.group(0).lower().startswith(('zähl', 'zaehl')) and re.search(r'\bauf\b', satz[m.end():])):
+                    return m.group(0)
+                for m in RECHEN_NOMEN.finditer(satz):
+                    # „Durchschnitt: {{ … }}“, „Summe von 12“ oder „{{ … }} Prozent“ nennt eine fertige Zahl
+                    if GEGEBEN_DANACH.match(satz, m.end()) or GEGEBEN_DAVOR.search(satz[max(0, m.start() - 12):m.start()]):
+                        continue
+                    return m.group(0)
+                m = RECHEN_FRAGE.search(satz)
+                if m:
+                    return m.group('a') or m.group('b') or m.group('c')
+        return ''
+
+    # Zugang fehlt (Sprachmodelle prüft ki) -----------------------------------------------------------------------
+    def zugaenge(self):
+        ohne = []
+        for name in self.namen():
+            basis = re.sub(r'(?:tool|trigger)$', '', self.w.art(name))
+            braucht = basis in ZUGANG_NOETIG or (basis == 'httprequest' and
+                                                 self.w.p(name).get('authentication') not in (None, '', 'none'))
+            if braucht and not self.w.knoten[name].get('credentials'):
+                ohne.append(name)
+        if ohne:
+            self.fehler('Zugang', f'Ohne Zugang (credentials fehlt): {liste(ohne, 6)}. Die Prüfung von n8n meldet das nicht, der '
+                        'Lauf scheitert erst dort. Setz einen gemerkten Zugang ein (buildbar-status) oder bitte die Person, ihn im '
+                        'Knoten auszuwählen und zu speichern, danach buildbar-merken aus-workflow <Workflow-ID>.')
+
+    # 6 ---------------------------------------------------------------------------------------------------------------
+    def teuer(self, name):
+        """Kurze Bezeichnung, wenn ein Aufruf dieses Knotens Geld kostet, sonst ''."""
+        art = self.w.art(name)
+        bid = self.w.baustein(name)
+        if bid in BEZAHLT:
+            return f'Baustein {KURZ.get(bid, BAUSTEINE[bid])}'
+        if art in KETTEN or art in KI_DIREKT:
+            return 'KI'
+        if art == 'httprequest' and BEZAHLTE_ADRESSEN.search(str(self.w.p(name).get('url') or '')):
+            return 'bezahlter Dienst'
+        return ''
+
+    def zaehler_davor(self, eingang, name):
+        """'ja', wenn zwischen Eingang und Knoten gezählt und begrenzt wird: eine Tabelle wird gelesen, und danach lehnt ein
+        IF, Switch, Filter oder Code ab. Sonst 'liest' (gelesen, nicht begrenzt), 'schreibt' (nur beschrieben) oder ''."""
+        zwischen = self.w.vorfahren(name) & self.w.nachfahren(eingang)
+        stand = ''
+        for z in sorted(zwischen):
+            art = self.w.art(z)
+            if not self.w.an(z):
+                continue
+            if art == 'code' and 'getWorkflowStaticData' in str(self.w.p(z).get('jsCode') or ''):
+                return 'ja'
+            if art != 'datatable':
+                continue
+            vorgang = str(self.w.p(z).get('operation') or 'insert')
+            if vorgang in ('rowExists', 'rowNotExists'):
+                return 'ja'
+            if vorgang == 'get':
+                danach = self.w.nachfahren(z) & zwischen
+                if any(self.w.an(x) and self.w.art(x) in ('if', 'switch', 'filter', 'code', 'stopanderror') for x in danach):
+                    return 'ja'
+                stand = 'liest'
+            elif not stand:
+                stand = 'schreibt'
+        return stand
+
+    def kosten(self):
+        for eingang in self.w.eingaenge:
+            if not self.w.oeffentlich(eingang):
+                continue
+            offen, staende, geteilt = [], set(), False
+            for name in self.namen():
+                if name not in self.w.nachfahren(eingang) or not self.teuer(name):
+                    continue
+                stand = self.zaehler_davor(eingang, name)
+                if stand == 'ja':
+                    continue
+                staende.add(stand)
+                geteilt = geteilt or self.w.baustein(name) in GETEILTES_LIMIT
+                offen.append(f'{anf(name)} ({self.teuer(name)})')
+            if not offen:
+                continue
+            gezeigt = ', '.join(offen[:5]) + (f' und {len(offen) - 5} weitere' if len(offen) > 5 else '')
+            text = (f'{anf(eingang)} ist öffentlich und führt ohne Tageszähler zu {gezeigt}. Wer die Adresse kennt, kann damit '
+                    'beliebig oft Kosten auslösen')
+            text += ' und das Tageslimit aufbrauchen, das sich alle Personen teilen. ' if geteilt else '. '
+            if 'liest' in staende:
+                text += 'Eine Data Table wird davor gelesen, aber kein IF, Switch oder Filter lehnt ab der Grenze ab. '
+            elif 'schreibt' in staende:
+                text += ('Eine Data Table liegt davor, sie wird dort aber nur beschrieben (insert, update oder upsert), nicht vor '
+                         'dem Aufruf gelesen und begrenzt. ')
+            text += ('Zähl die Aufrufe je Tag in einer Data Table (vor dem Aufruf lesen) und lehn ab der Zahl aus dem Bauplan ab: '
+                     'Skill buildbar-n8n-security-audit, Abschnitt „Kosten“.')
+            self.hinweis('Kosten', text)
+
+    # 9 ---------------------------------------------------------------------------------------------------------------
+    def holt_daten(self, name):
+        art = self.w.art(name)
+        p = self.w.p(name)
+        vorgang = str(p.get('operation') or '').lower()
+        if art == 'httprequest':
+            return True
+        if art == 'executeworkflow':
+            return not self.w.baustein(name)       # Bausteine liefern laut Vertrag immer genau einen Eintrag
+        if art in LESEN:
+            return vorgang in LESEN[art] and str(p.get('resource') or 'row').lower() in ('row', 'sheet')
+        return vorgang in LESEN_ALLGEMEIN and str(self.w.knoten[name].get('type') or '').startswith('n8n-nodes-base.')
+
+    def leere_ketten(self):
+        namen = [n for n in self.namen() if self.w.ziele(n) and self.w.knoten[n].get('alwaysOutputData') is not True
+                 and self.holt_daten(n)]
+        if namen:
+            self.hinweis('0 Einträge', f'Daten holen ohne alwaysOutputData: {liste(namen, 6)}. Kommen dort 0 Einträge zurück (leere '
+                         'Liste, keine passende Zeile), stoppt die Kette ohne Meldung, und bei einem Webhook bleibt die Antwort aus. '
+                         'Setz alwaysOutputData: true und behandle den leeren Fall im Schritt danach.')
+
+    def tabellen(self):
+        """Data Table „Get Row(s)“ ohne returnAll und ohne eigenes limit: n8n liefert höchstens 50 Zeilen, auch mit Filter."""
+        namen = []
+        for name in self.namen('datatable'):
+            p = self.w.p(name)
+            if str(p.get('operation') or '') != 'get' or str(p.get('resource') or 'row') != 'row':
+                continue
+            if p.get('returnAll') not in (None, False, '') or 'limit' in p:
+                continue
+            filter_ = p.get('filters') if isinstance(p.get('filters'), dict) else {}
+            bedingungen = [b for b in filter_.get('conditions') or [] if isinstance(b, dict)] \
+                if isinstance(filter_.get('conditions'), list) else []
+            einzeln = [b for b in bedingungen if str(b.get('condition') or 'eq') == 'eq' and (
+                EINZELSPALTE.search(str(b.get('keyName') or '')) or
+                re.search(r'\$now|\$today|DateTime', str(b.get('keyValue') or '')))]
+            if einzeln and (len(bedingungen) == 1 or p.get('matchType') == 'allConditions'):
+                continue        # Tageszähler oder Abfrage einer Kennung: höchstens eine Zeile
+            namen.append(f'{anf(name)} ({"mit" if bedingungen else "ohne"} Filter)')
+        if namen:
+            gezeigt = ', '.join(namen[:4]) + (f' und {len(namen) - 4} weitere' if len(namen) > 4 else '')
+            self.hinweis('50 Zeilen', f'Tabelle lesen ohne returnAll: true: {gezeigt}. n8n liefert dann höchstens 50 Zeilen, mit '
+                         'Filter höchstens 50 passende, der Rest fehlt ohne Meldung. Können es mehr werden, setz returnAll: true und '
+                         'zähl im Test nach, ob alle Zeilen ankommen. Ein Tageszähler oder die Abfrage einer Kennung (Filter mit eq '
+                         'auf eine Spalte wie tag oder id) ist in Ordnung.')
+
+    # Knoten, die nie laufen ---------------------------------------------------------------------------------------
+    def haengend(self):
+        lose = []
+        for name in self.namen():
+            art = self.w.art(name)
+            if 'trigger' in art or art in ('webhook', 'cron', 'interval', 'start', 'emailreadimap'):
+                continue
+            if self.w.ein[name] or self.w.ki_aus[name]:
+                continue
+            if UNTERKNOTEN.match(art) or art.startswith('tool'):
+                if not self.w.ziele(name):
+                    eingang = next((e for anfang, e in (('lm', 'ai_languageModel'), ('outputparser', 'ai_outputParser'),
+                                                        ('memory', 'ai_memory'), ('embeddings', 'ai_embedding'), ('tool', 'ai_tool'))
+                                    if art.startswith(anfang)), 'ai_…')
+                    self.hinweis('Unverbunden', f'Hängt an keinem KI-Knoten und wird nicht benutzt. Verbinde den Knoten mit '
+                                 f'sourceOutput: "{eingang}" oder nimm ihn heraus.', anf(name))
+                continue
+            lose.append(name)
+        if lose:
+            self.hinweis('Unverbunden', f'Ohne Vorgänger, läuft also nie: {liste(lose, 6)}. Verbinde den Knoten oder nimm ihn '
+                         'heraus. Fehlt eine Verbindung, prüf auch branch und case am Knoten davor.')
+
+    # 13, zweiter Teil -----------------------------------------------------------------------------------------------
+    def notizen(self):
+        if not any(self.w.art(n) == 'stickynote' for n in self.w.knoten):
+            self.hinweis('Notizen', 'Im Workflow steht noch keine Notiz (Sticky Note). Vor dem Abschluss gehören Notizen in '
+                         'einfacher Sprache hinein: Skill buildbar-n8n-dokumentation, danach activateWorkflow.')
+
+    # 14 --------------------------------------------------------------------------------------------------------------
+    def heikel(self, name):
+        art = self.w.art(name)
+        return art in ('httprequest', 'httprequesttool', 'code', 'executeworkflow') or art in KETTEN or art in KI_DIREKT \
+            or bool(MODELL.match(art))
+
+    def knotennamen(self):
+        heikel = [n for n in self.w.doppelt if any(self.heikel(s) for s in self.w.gleichnamig[n])]
+        harmlos = [n for n in self.w.doppelt if n not in heikel]
+        if heikel:
+            self.fehler('Namen', f'Mehrere Knoten heißen gleich: {liste(heikel, 5)}, darunter HTTP, Code, KI oder ein Baustein. '
+                        'Welcher davon läuft und welchen $(\'…\') trifft, ist nicht sicher; geprüft sind hier alle, der zweite '
+                        'heißt in den Befunden „Name [2]“. Gib jedem Knoten einen eigenen Namen.')
+        if harmlos:
+            self.hinweis('Namen', f'Mehrere Knoten heißen gleich: {liste(harmlos, 5)}. Verbindungen und Ausdrücke mit '
+                         '$(\'…\') treffen dann den falschen Knoten. Gib jedem Knoten einen eigenen Namen.')
+        standard = []
+        for name in self.w.knoten:
+            art = self.w.art(name)
+            echt_ = self.w.echter_name(name)
+            if art == 'stickynote':
+                continue
+            m = re.fullmatch(r'(.*?)\s?(\d+)', echt_)
+            if (m and m.group(1).strip().lower() in STANDARDNAMEN) or (echt_.strip().lower() in STANDARDNAMEN and art in ARBEITSKNOTEN):
+                standard.append(echt_)
+        if standard:
+            self.hinweis('Namen', f'Standardnamen: {liste(standard, 6)}. Das erschwert Ausdrücke mit $(\'…\') und das Lesen. Gib den '
+                         'Knoten Namen, die sagen, was sie tun (updateNode mit name).')
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Holen, berichten, Aufruf
+# ---------------------------------------------------------------------------------------------------------------------
+def auspacken(d):
+    """Der Workflow aus der Antwort von n8n-werkzeug ({"success": true, "data": {...}}) oder aus einer Datei."""
+    for _ in range(3):
+        if isinstance(d, dict) and isinstance(d.get('nodes'), list):
+            return d
+        if isinstance(d, dict):
+            d = next((d[k] for k in ('data', 'workflow') if isinstance(d.get(k), (dict, list))), None)
+        elif isinstance(d, list) and len(d) == 1:
+            d = d[0]
+        else:
+            break
+    return None
+
+
+def json_lesen(text):
+    text = text.strip().lstrip('﻿')
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    i = text.find('{')
+    if i >= 0:
+        try:
+            return json.JSONDecoder().raw_decode(text[i:])[0]
+        except ValueError:
+            pass
+    return None
+
+
+def aus_datei(pfad):
+    if not os.path.isfile(pfad):
+        raus(f'Die Datei {pfad} gibt es nicht. Aufruf: workflow-pruefen --datei <pfad zu einer Workflow-JSON-Datei>', 2)
+    try:
+        with open(pfad, encoding='utf-8-sig') as f:
+            d = json_lesen(f.read())
+    except (OSError, UnicodeDecodeError) as e:
+        raus(f'FEHLER: Die Datei {pfad} ließ sich nicht lesen ({type(e).__name__}).', 1)
+    wf = auspacken(d)
+    if wf is None:
+        raus(f'FEHLER: In {pfad} steht kein Workflow (JSON mit „nodes“ und „connections“). Sichern geht mit n8n_get_workflow.', 1)
+    return wf
+
+
+def aus_n8n(wid):
+    import shlex
+    import subprocess
+    befehl = shlex.split(os.environ.get('WORKFLOW_PRUEFEN_WERKZEUG') or '') or [WERKZEUG]
+    try:
+        r = subprocess.run(befehl + ['n8n_get_workflow', json.dumps({'id': wid, 'mode': 'full'})], capture_output=True,
+                           text=True, encoding='utf-8', errors='replace', timeout=150)
+    except FileNotFoundError:
+        raus('FEHLER: Der Befehl n8n-werkzeug fehlt in diesem Terminal. Bitte die Betreuung fragen.', 1)
+    except subprocess.TimeoutExpired:
+        raus('FEHLER: n8n hat nach 150 Sekunden nicht geantwortet. In ein paar Minuten noch einmal versuchen; '
+             '„buildbar-status“ zeigt, ob n8n verbunden ist.', 1)
+    d = json_lesen(r.stdout or '')
+    wf = auspacken(d)
+    if wf is not None and not (isinstance(d, dict) and d.get('success') is False):
+        return wf
+    if d is None and 'Response truncated due to size limits' in (r.stdout or '')[-500:]:
+        raus(f'FEHLER: Der Workflow {wid} ist zu groß für eine Abfrage: n8n-mcp schneidet Antworten über 1 MB ab. Meist stecken '
+             'große Daten in einem Code-Knoten oder einer Notiz. Lange Listen gehören in eine Data Table, danach erneut prüfen.', 1)
+    grund = ''
+    if isinstance(d, dict):
+        grund = str(d.get('error') or d.get('message') or '')
+    grund = grund or (r.stderr or '').strip() or (r.stdout or '').strip()
+    grund = kuerzen(re.sub(r'^FEHLER:\s*', '', grund.splitlines()[0]) if grund else f'Rückgabewert {r.returncode}', 300)
+    raus(f'FEHLER: Der Workflow {wid} ließ sich nicht holen: {grund}\nGibt es ihn im eigenen Konto (n8n_list_workflows)? '
+         'Ob n8n verbunden ist, zeigt „buildbar-status“.', 1)
+
+
+def zusammenfassen(befunde):
+    """Derselbe Befund an mehreren Knoten wird eine Zeile: „A“, „B“ und 3 weitere: Text."""
+    gruppen = {}
+    for stufe, pruefung, text, wer in befunde:
+        gruppen.setdefault((stufe, pruefung, text) if wer else (stufe, pruefung, text, len(gruppen)), []).append(wer)
+    fertig = []
+    for schluessel, wer in gruppen.items():
+        text = schluessel[2]
+        if wer[0]:
+            text = ', '.join(wer[:4]) + (f' und {len(wer) - 4} weitere' if len(wer) > 4 else '') + ': ' + text
+        fertig.append((schluessel[0], schluessel[1], text))
+    return fertig
+
+
+def bericht(wf, pruefer, nochmal):
+    knoten = [n for n in wf.knoten if wf.art(n) != 'stickynote']
+    notizen = len(wf.knoten) - len(knoten)
+    umfang = f'{len(knoten)} Knoten' + (f', {notizen} {"Notiz" if notizen == 1 else "Notizen"}' if notizen else '')
+    befunde = zusammenfassen(pruefer.befunde)
+    # Was sich nicht prüfen ließ, steht ganz oben: Sonst geht es unter
+    befunde.sort(key=lambda b: b[1] != 'Prüfung unvollständig')
+    fehler = [b for b in befunde if b[0] == 'FEHLER']
+    hinweise = [b for b in befunde if b[0] == 'HINWEIS']
+    unvollstaendig = [b for b in fehler if b[1] == 'Prüfung unvollständig']
+    name = anf(kuerzen(wf.name, 80))
+    if not befunde:
+        kopf = [f'KEINE STILLEN FEHLER GEFUNDEN. Geprüft: {name}, {umfang}.']
+    else:
+        kopf = [f'{len(fehler)} FEHLER, {len(hinweise)} {"HINWEIS" if len(hinweise) == 1 else "HINWEISE"} in {name}, {umfang}']
+    fuss = []
+    if pruefer.ungeprueft:
+        fuss.append('Nicht geprüft: ' + '; '.join(dict.fromkeys(pruefer.ungeprueft)) + '.')
+    if pruefer.fremd:
+        fuss.append('JETZT: Diesen Workflow änderst und testest du nicht, solange sein Name nicht mit „buildbar: “ beginnt. Die '
+                    'Befunde kannst du der Person in einfachen Worten erklären.')
+    elif pruefer.abgelegt:
+        text = ('JETZT: Dieser Workflow ist als ALT abgelegt und bleibt deaktiviert. Du baust nicht an ihm weiter und aktivierst '
+                'ihn nicht, sondern arbeitest im aktuellen Workflow.')
+        if any(b[1] == 'Aktiv' for b in fehler):
+            text += ' Deaktiviere ihn (deactivateWorkflow).'
+        if any(b[1] == 'Zugangsdaten' for b in fehler):
+            text += ' Den Schlüssel nimmst du trotzdem heraus und lässt ihn beim Anbieter erneuern.'
+        fuss.append(text)
+    elif unvollstaendig and len(unvollstaendig) == len(fehler):
+        fuss.append('JETZT: Die Prüfung ist unvollständig. Prüf die genannten Punkte von Hand und behebe, was du findest, bevor du '
+                    f'weiterbaust. Danach erneut: {nochmal}.')
+    elif fehler:
+        zahl = len(fehler) - len(unvollstaendig)
+        fuss.append(f'JETZT: Behebe {"den FEHLER" if zahl == 1 else f"die {zahl} FEHLER"} (n8n_update_partial_workflow), ruf '
+                    f'activateWorkflow auf und prüf erneut: {nochmal}. Erst danach baust du weiter.'
+                    + (' Was unter „Prüfung unvollständig“ steht, prüfst du vorher von Hand.' if unvollstaendig else ''))
+    elif hinweise:
+        fuss.append('JETZT: Kein FEHLER, du kannst weiterbauen. Die HINWEISE klärst du spätestens vor dem Abschluss. Den Test '
+                    'mit einem echten Beispiel ersetzt diese Prüfung nicht.')
+    else:
+        fuss.append('Das ersetzt nicht den Test mit einem echten Beispiel: Hol nach dem Testlauf die Ausführung '
+                    '(n8n_executions) und prüf das Ergebnis inhaltlich.')
+
+    def block(titel, eintraege, platz):
+        zeilen = [titel]
+        for i, (_, pruefung, text) in enumerate(eintraege, 1):
+            zeile = f'{i}. [{pruefung}] {kuerzen(text, 700)}'
+            if sum(len(z) + 1 for z in zeilen) + len(zeile) > platz:
+                zeilen.append(f'… und {len(eintraege) - i + 1} weitere, hier nicht gezeigt. Behebe die oberen und prüf dann erneut.')
+                break
+            zeilen.append(zeile)
+        return zeilen
+
+    platz = GRENZE - sum(len(z) + 1 for z in kopf + fuss) - 300
+    teile = []
+    if fehler:
+        teile += block('FEHLER (beheben, bevor du weiterbaust):', fehler, max(platz - (500 if hinweise else 0), 600))
+    if hinweise:
+        teile += block('HINWEISE (spätestens vor dem Abschluss klären):', hinweise, max(platz - sum(len(z) + 1 for z in teile), 400))
+    return maskieren('\n'.join(kopf + teile + fuss))
+
+
+def main(args):
+    for strom in (sys.stdout, sys.stderr):
+        try:
+            strom.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
+    if not args or args[0] in ('hilfe', '-h', '--help'):
+        print(__doc__.strip() + '\n\n' + PRUEFUNGEN)
+        return 0
+    aufruf = 'Aufruf: workflow-pruefen <workflow-id>  oder  workflow-pruefen --datei <pfad>  (Hilfe: workflow-pruefen hilfe)'
+    if args[0] == '--datei':
+        if len(args) != 2:
+            raus('Nach --datei kommt genau ein Pfad zu einer Workflow-JSON-Datei.\n' + aufruf, 2)
+        roh = aus_datei(args[1])
+        nochmal = 'workflow-pruefen ' + (str(roh.get('id')) if ID_OK.match(str(roh.get('id') or '')) else '<workflow-id>')
+    elif len(args) == 1 and not args[0].startswith('-'):
+        wid = args[0]
+        if wid in BAUSTEINE:
+            raus(f'{wid} ist der Baustein „{BAUSTEINE[wid]}“ der Betreuung. Bausteine prüfst und änderst du nicht, du rufst sie '
+                 'nur aus dem eigenen Workflow auf. Gib die ID des eigenen Workflows an.', 2)
+        if not ID_OK.match(wid):
+            tipp = ' Für eine Datei: workflow-pruefen --datei <pfad>.' if os.path.exists(wid) or wid.endswith('.json') else ''
+            raus(f'„{kuerzen(wid, 40)}“ ist keine Workflow-ID (8 bis 40 Buchstaben und Ziffern, n8n_list_workflows zeigt sie).'
+                 f'{tipp}\n{aufruf}', 2)
+        roh = aus_n8n(wid)
+        nochmal = f'workflow-pruefen {wid}'
+    else:
+        raus(aufruf, 2)
+    wf = Workflow(roh)
+    if not wf.knoten:
+        raus(f'Der Workflow {anf(kuerzen(wf.name, 80))} hat noch keine Knoten. Es gibt nichts zu prüfen.', 0)
+    print(bericht(wf, Pruefer(wf, kuerzel_laden()).alles(), nochmal))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        ende = main(sys.argv[1:])
+        sys.stdout.flush()
+    except BrokenPipeError:         # die Ausgabe wurde abgeschnitten, zum Beispiel mit „| head“
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        ende = 0
+    except Exception as fehler:     # nie eine rohe Fehlerspur: Die Ausgabe liest der Assistent
+        print(f'FEHLER: workflow-pruefen ist selbst gescheitert ({type(fehler).__name__}, {fehlerstelle(fehler)}). Das sagt '
+              'nichts über den Workflow. Prüf ihn mit n8n_validate_workflow und einem Testlauf und gib diese Zeile der '
+              'Betreuung weiter.')
+        ende = 1
+    sys.exit(ende)

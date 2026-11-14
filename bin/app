@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
-"""app: eigene Apps anlegen, auflisten und veroeffentlichen (buildbar auf one.intelligence).
+"""app: eigene Apps anlegen, ansehen und veröffentlichen (buildbar auf one.intelligence).
 
   app neu <name> ["Titel"]          neue App mit eigener Adresse, Ordner ~/apps/<name>
   app liste                         alle eigenen Apps mit Adresse und Stand
   app status [<name>]               Stand einer App (ohne Name: die App im aktuellen Ordner)
-  app veroeffentlichen [<name>] ["Nachricht"]
-                                    Build pruefen, nach Gitea uebertragen, warten bis die neue Fassung live ist
+  app ansehen [<name>] [--schritte <datei.json>] [--name <kurzname>]
+                                    bauen, hier kurz starten und im Browser prüfen wie mit seite-pruefen (Bericht,
+                                    zwei Bilder), ohne zu veröffentlichen. Danach läuft hier nichts mehr davon.
+  app veroeffentlichen [<name>] ["Nachricht"] [--schritte <datei.json>] [--ohne-vorpruefung]
+                                    bauen, die Seite vorher hier prüfen (harte Fehler halten an), nach Gitea
+                                    übertragen, warten bis die neue Fassung live ist, dann die echte Adresse prüfen
+                                    (mit den Schritten, wenn angegeben)
+
+Statt einer eigenen Vorschau (npm run dev, npm start) immer „app ansehen“. Es läuft immer nur ein Bau zur selben
+Zeit, ein zweiter wartet bis zu 15 Minuten. --ohne-vorpruefung nur, wenn die Vorprüfung selbst nicht geht.
 """
 import glob
 import json
 import os
 import random
 import re
+import shutil
+import signal
+import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BEKANNT = {'ZUSATZ', 'KUERZEL', 'PERSON_ID', 'N8N_API_URL', 'N8N_API_KEY', 'OIL_HUB_URL', 'OIL_HUB_TOKEN'}
-GEHEIM = ('N8N_API_KEY', 'OIL_HUB_TOKEN', 'HUB_TOKEN', 'OI_API_KEY')
+# Das bekommen Unterprogramme (npm, Next.js, git) nicht. OPEN_TERMINAL_API_KEY ist der Schlüssel des Terminals selbst.
+GEHEIM = ('N8N_API_KEY', 'OIL_HUB_TOKEN', 'HUB_TOKEN', 'OI_API_KEY', 'OPEN_TERMINAL_API_KEY')
 
 
 def _umgebung_laden():
@@ -45,6 +60,15 @@ HUB = os.environ.get('OIL_HUB_URL', 'https://oi-labor-hub.friedemann-schuetz.eu'
 TOKEN = os.environ.get('OIL_HUB_TOKEN', '')
 APPS = os.path.join(os.path.expanduser('~'), 'apps')
 PLATZ_MB = 800  # so viel soll im Home frei sein, bevor Pakete installiert werden
+# Bausperre und Ansicht der gebauten App (app ansehen, Vorprüfung beim Veröffentlichen)
+SPERRE = '/tmp/buildbar-bau.lock'  # nur ein Bau je Arbeitsplatz, siehe Bausperre
+SPERRE_WARTEN = 15 * 60            # so lange wartet ein Bau höchstens auf einen anderen (Sekunden)
+START_WARTEN = 60                  # so lange darf die gebaute App bis zur ersten Antwort brauchen (Sekunden)
+SEITE_ZEIT = 5 * 60                # Notbremse für seite-pruefen ohne Schritte (Sekunden)
+SEITE_ZEIT_SCHRITTE = 15 * 60      # dasselbe mit Schritten (die dürfen selbst lange warten)
+FEHLER_MAX = 8                     # so viele Einträge zeigt seite-pruefen unter „Fehler im Browser“ höchstens
+SCHRITTE_MAX = 1000 * 1000         # so groß darf die Datei mit den Schritten höchstens sein (Bytes)
+PROC = '/proc'                     # Prozessliste von Linux (gruppe_beenden sucht dort Nachfahren in eigener Gruppe)
 
 
 def hub(methode, pfad, body=None, timeout=120):
@@ -83,8 +107,8 @@ def ordner_von(name=None):
         if os.path.dirname(pfad) == APPS:
             return pfad
         pfad = os.path.dirname(pfad)
-    raus('Ich weiß nicht, welche App gemeint ist. Gib den Namen mit („app veroeffentlichen <name>“) '
-         'oder ruf den Befehl im Ordner der App auf (~/apps/<name>).')
+    raus('Ich weiß nicht, welche App gemeint ist. Gib den Namen mit (zum Beispiel „app veroeffentlichen <name>“ oder '
+         '„app ansehen <name>“) oder ruf den Befehl im Ordner der App auf (~/apps/<name>).')
 
 
 def meta(ordner):
@@ -152,13 +176,34 @@ def vorlage_fuer_oi(ziel):
 GIT_INTERN = 'http://oil-gitea:3000/'
 
 
+def person_meldung(s, b):
+    """Meldung in einfachen Worten, wenn der Bereitstellungsdienst auf /person nicht mit 200 antwortet."""
+    grund = str(b.get('fehler') or '') if isinstance(b, dict) else ''
+    if grund == f'HTTP {s}':
+        grund = ''  # so füllt hub() eine Antwort, die nicht vom Dienst selbst kommt (etwa die Fehlerseite eines Proxys)
+    if s == 503 and grund:
+        # Der Dienst selbst meldet, dass er gerade nicht kann (zum Beispiel antwortet Gitea nicht). Meist hilft ein
+        # zweiter Versuch. Der Weg zur Betreuung steht dabei, damit niemand ohne Ende wiederholt.
+        satz = 'Der Dienst ist gerade beschäftigt. Bitte gleich noch einmal versuchen.'
+        text = satz + '\nKlappt es nach ein paar Versuchen nicht, die Betreuung fragen.'
+        return text if grund == satz else text + '\nGenaue Meldung: ' + grund
+    if s in (401, 403):
+        text = 'Der Zugang zum Veröffentlichen passt nicht. Das liegt nicht an dir. Bitte die Betreuung fragen.'
+    else:
+        # auch 503 ohne Meldung des Dienstes: Dann antwortet nur ein Proxy davor, der Dienst selbst ist nicht da
+        text = ('Der Dienst zum Veröffentlichen antwortet gerade nicht. Das liegt nicht an dir. '
+                'In ein paar Minuten noch einmal versuchen; bleibt es so, die Betreuung fragen.')
+    return text + '\nGenaue Meldung: ' + (grund or f'HTTP {s}')
+
+
 def git_zugang():
     """Richtet Git für den Bereitstellungsdienst ein, falls noch nicht geschehen: öffentliche Gitea-Adresse statt der
-    internen, und im Kurs das persönliche Git-Token aus /person. Gibt keine Werte aus."""
+    internen, und im Kurs das persönliche Git-Token aus /person. Gibt keine Werte aus. Rückgabe: nichts, wenn der
+    Dienst geantwortet hat, sonst eine Meldung für die Person („app neu“ bricht damit vor dem Anlegen ab)."""
     os.makedirs(APPS, exist_ok=True)
     s, b = hub('GET', '/person')
     if s != 200:
-        return
+        return person_meldung(s, b)
     git_url = (b.get('git_url') or '').rstrip('/')
     if not git_url:
         return
@@ -180,22 +225,53 @@ def git_zugang():
 
 
 def neu(name, titel=''):
-    git_zugang()
+    meldung = git_zugang()
+    if meldung:
+        # Ohne Antwort auf /person kennt Git den Weg zum Repo nicht. Deshalb vor dem Anlegen abbrechen: Sonst gibt es
+        # die App beim Dienst, aber der Ordner fehlt. Ob es die App von einem früheren Versuch schon gibt, ist hier
+        # nicht bekannt. Die Meldung spricht deshalb nur von diesem Versuch.
+        raus(meldung + '\nBei diesem Versuch wurde nichts angelegt.')
     s, b = hub('POST', '/apps', {'name': name, 'titel': titel})
+    # „app neu“ lässt sich wiederholen: Gibt es die eigene App schon, antwortet der Dienst mit 200 und dem gespeicherten
+    # Eintrag ("vorhanden": true), eine ältere Fassung des Dienstes mit 409. Bei 409 zeigt GET /apps/<name>, ob es die
+    # eigene App ist (409 kommt auch bei zu vielen Apps oder vergebener Adresse). Dann fehlt höchstens noch der Ordner.
+    schon_da = s == 200 or bool(b.get('vorhanden'))
+    if s == 409:
+        s2, b2 = hub('GET', '/apps/' + name.strip().lower())
+        if s2 == 200:
+            s, b, schon_da = s2, b2, True
     if s not in (200, 201):
-        raus('FEHLER: ' + b.get('fehler', f'HTTP {s}') + (('\n' + b['details']) if b.get('details') else ''))
+        raus('FEHLER: ' + b.get('fehler', f'HTTP {s}') + (('\n' + b['details']) if b.get('details') else '')
+             + ('\nBitte mit demselben Namen noch einmal versuchen. Ist die App schon angelegt, holt „app neu“ nur noch '
+                'den Ordner.' if s == 599 else ''))
     ziel = os.path.join(APPS, b['name'])
+    if schon_da and os.path.isdir(ziel):
+        text = f'Die App gibt es schon, der Ordner ist da: {ziel}\nAdresse: {b["adresse"]}'
+        if not os.path.isdir(os.path.join(ziel, '.git')):
+            text += ('\nAchtung: In diesem Ordner liegt kein geholter Stand der App (der Unterordner .git fehlt). '
+                     f'Benenne den Ordner um und ruf „app neu {b["name"]}“ noch einmal auf, dann wird die App geholt.')
+        raus(text, 0)
+    if schon_da:
+        print(f'Die App „{b["name"]}“ gibt es schon, hier fehlt nur der Ordner. Er wird jetzt geholt ...', flush=True)
     os.makedirs(APPS, exist_ok=True)
     r = lauf(['git', 'clone', '-q', b['git'], ziel], APPS)
     if r.returncode != 0:
-        raus('App angelegt, aber das Holen ging nicht: ' + re.sub(r'//[^@/]+@', '//', r.stderr)[-300:])
+        if os.path.isdir(ziel) and os.listdir(ziel):
+            rat = f'Der Ordner {ziel} ist im Weg, dort liegt schon etwas. Benenne ihn um und ruf „app neu {b["name"]}“ noch einmal auf.'
+        else:
+            rat = (f'Bitte gleich noch einmal versuchen: „app neu {b["name"]}“ holt den Ordner nach. '
+                   'Klappt es wieder nicht, die Betreuung fragen.')
+        raus(('Die App gibt es schon' if schon_da else 'App angelegt') + ', aber das Holen ging nicht: '
+             + re.sub(r'//[^@/]+@', '//', r.stderr)[-300:].rstrip() + '\n' + rat)
     with open(os.path.join(ziel, '.oil-app.json'), 'w') as f:
         json.dump({'name': b['name'], 'adresse': b['adresse']}, f)
     vorlage_fuer_oi(ziel)
-    print(f'App angelegt: {b["name"]}\nAdresse: {b["adresse"]}\nOrdner: {ziel}\nInstalliere die Pakete (1 bis 2 Minuten) ...', flush=True)
-    platz_schaffen(ziel)
-    if lauf(['npm', 'ci', '--no-audit', '--no-fund'], ziel, '/tmp/npm-ci-' + b['name'] + '.log') != 0:
-        print('Hinweis: npm ci meldete einen Fehler, Protokoll in /tmp/npm-ci-' + b['name'] + '.log')
+    kopf = 'Ordner geholt, die App gab es schon' if schon_da else 'App angelegt'
+    print(f'{kopf}: {b["name"]}\nAdresse: {b["adresse"]}\nOrdner: {ziel}\nInstalliere die Pakete (1 bis 2 Minuten) ...', flush=True)
+    with Bausperre(ZEITENDE_NEU):  # platz_schaffen räumt in anderen Apps auf: nie während dort gebaut wird
+        platz_schaffen(ziel)
+        if bau_lauf(['npm', 'ci', '--no-audit', '--no-fund'], ziel, '/tmp/npm-ci-' + b['name'] + '.log') != 0:
+            print('Hinweis: npm ci meldete einen Fehler, Protokoll in /tmp/npm-ci-' + b['name'] + '.log')
     print('Fertig. ' + b.get('hinweis', ''))
 
 
@@ -219,28 +295,637 @@ def status(name=None):
     print(f'{b["name"]}: {b["adresse"]}\nLaufzeit: {b.get("laufzeit")}\nLetzter Build: {lb.get("status", "-")} ({lb.get("beginn", "")} bis {lb.get("ende", "")})')
 
 
+def hat_workflow(o):
+    """Gehört zur App ein Workflow in n8n? Ja, wenn im Ordner eine Datei workflows/*.json liegt oder mein-use-case.md
+    einen Workflow mit „buildbar: “ nennt. Manche Anwendungen haben keinen, sie werten nur eine Datei im Browser aus.
+    Nach „buildbar: “ muss ein Buchstabe oder eine Ziffer folgen (der Name des Workflows). Platzhalter („buildbar: <Name>“,
+    „buildbar: ‹Name›“, „buildbar: …“) und das Präfix allein (etwa „`buildbar: `“) zählen nicht."""
+    if glob.glob(os.path.join(o, 'workflows', '*.json')):
+        return True
+    try:
+        with open(os.path.join(o, 'mein-use-case.md'), encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    except OSError:
+        return False
+    return re.search(r'buildbar: [^\W_]', text) is not None
+
+
 def offen_vor_abschluss(o):
-    """Was von den Pflichtschritten vor dem Abschluss noch nicht im Ordner der App zu sehen ist."""
+    """Was von den Pflichtschritten vor dem Abschluss noch nicht im Ordner der App zu sehen ist. Ohne Workflow gibt es
+    keine Notizen im Workflow (die Beschreibung steht dann in mein-use-case.md); der Prüfbericht gehört immer dazu."""
     fehlt = []
-    dateien = glob.glob(os.path.join(o, 'workflows', '*.json'))
-    if not any('n8n-nodes-base.stickyNote' in open(p, encoding='utf-8', errors='ignore').read() for p in dateien):
-        fehlt.append('Notizen im Workflow (Skill n8n-dokumentation, danach Workflow-Datei neu sichern)')
+    if hat_workflow(o):
+        dateien = glob.glob(os.path.join(o, 'workflows', '*.json'))
+        if not any('n8n-nodes-base.stickyNote' in open(p, encoding='utf-8', errors='ignore').read() for p in dateien):
+            fehlt.append('Notizen im Workflow (Skill n8n-dokumentation, danach Workflow-Datei neu sichern)')
     if not os.path.exists(os.path.join(o, 'pruefbericht.md')):
         fehlt.append('Prüfbericht (Skill pruefbericht)')
     return fehlt
 
 
-def veroeffentlichen(name=None, nachricht='Aktualisierung'):
+def erinnerung(o):
+    """Der Hinweis am Ende von „app veroeffentlichen“, solange vor dem Abschluss noch etwas fehlt (sonst leer)."""
+    fehlt = offen_vor_abschluss(o)
+    if not fehlt:
+        return ''
+    if hat_workflow(o):
+        schritte = 'n8n-testdaten, n8n-dokumentation, n8n-security-audit, pruefbericht'
+    else:
+        schritte = 'Tests, Abschnitt „So rechnet die Seite“ in mein-use-case.md, Sicherheits-Check, Prüfbericht'
+    return ('Hinweis: Vor dem Abschluss fehlt noch: ' + '; '.join(fehlt) + '. '
+            f'Alle vier Pflichtschritte ({schritte}) gehören dazu.')
+
+
+# Die Adresse der fertigen App stand in zwei Probeläufen nur im Denken des Modells und kam erst nach 5 bis 12 Minuten in den
+# Chat (Labor, 14.11.2026). Deshalb sagt der Befehl selbst, was jetzt als sichtbare Zeile in den Chat gehört.
+ZUERST_SAGEN = ('JETZT ZUERST, falls in diesem Chat noch nicht geschehen: Schreib als sichtbare Zeile im Chat (nicht nur '
+                'denken), noch vor dem nächsten Werkzeugaufruf: „Deine Anwendung ist online: [{a}]({a}). Probier sie gleich '
+                'aus. Ich prüfe sie währenddessen weiter, das Ergebnis steht in etwa einer Viertelstunde hier darunter.“')
+
+
+# --- Bausperre, Prozessgruppen, Ansicht der gebauten App ---------------------------------------------------------------
+ZEITENDE_BAU = ('Der andere Bau ist nach 15 Minuten noch nicht fertig. Ich breche ab: Es wurde nichts gebaut und nichts '
+                'veröffentlicht. Bitte später noch einmal versuchen.')
+ZEITENDE_NEU = ('Der andere Bau ist nach 15 Minuten noch nicht fertig. Die App ist angelegt und der Ordner ist da, nur die '
+                'Pakete fehlen noch. Die installiert „app ansehen“ mit, sobald kein anderer Bau mehr läuft.')
+
+
+class Bausperre:
+    """Im Arbeitsplatz läuft immer nur ein Bau: npm run build braucht bis 1,44 von 2 GB Arbeitsspeicher, auch wenn die
+    Person zwei Chats offen hat. Die Sperre ist ein flock auf SPERRE. Das System gibt sie frei, sobald kein Prozess sie
+    mehr offen hat: „app“ selbst und der Bau, der sie erbt (bau_lauf). seite-pruefen nimmt dieselbe Sperre, außer
+    BUILDBAR_SPERRE_GEHALTEN=1 steht in seiner Umgebung (so ruft „app“ es auf, während es die Sperre hält).
+    zeitende: Text, mit dem „app“ abbricht, wenn die Sperre nach SPERRE_WARTEN noch belegt ist. Bei None bricht es nicht
+    ab. Nach dem Eintritt ist gehalten True (Sperre gehalten), False (Wartezeit abgelaufen) oder None (ging nicht)."""
+    offen = None  # Dateinummer der gehaltenen Sperre, solange ein Block mit Bausperre läuft (bau_lauf gibt sie weiter)
+
+    def __init__(self, zeitende=ZEITENDE_BAU):
+        self.zeitende, self.gehalten, self.fd = zeitende, None, None
+
+    def __enter__(self):
+        try:
+            import fcntl  # nur unter Linux, das Image ist Linux
+        except ImportError:  # anderes System (etwa beim Testen unter Windows): dort gibt es diese Sperre nicht
+            return self
+        try:
+            # Keinem Link folgen und nicht hängen bleiben, falls dort statt einer Datei etwa eine FIFO liegt
+            self.fd = os.open(SPERRE, os.O_RDONLY | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+                              | getattr(os, 'O_NONBLOCK', 0), 0o666)
+            if not stat.S_ISREG(os.fstat(self.fd).st_mode):
+                raise OSError(f'{SPERRE} ist keine normale Datei')
+            if self._nehmen(fcntl):
+                return self
+        except OSError:
+            self._frei()
+            print('Hinweis: Ich konnte nicht prüfen, ob gerade ein anderer Bau läuft. Ich mache trotzdem weiter.',
+                  flush=True)
+            return self
+        print('Ein anderer Bau läuft gerade in diesem Arbeitsplatz. Ich warte, bis er fertig ist.', flush=True)
+        ende = time.monotonic() + SPERRE_WARTEN
+        while time.monotonic() < ende:
+            time.sleep(min(2.0, max(0.1, ende - time.monotonic())))
+            if self._nehmen(fcntl):
+                return self
+        self._frei()
+        self.gehalten = False
+        if self.zeitende is not None:
+            raus(self.zeitende)
+        return self
+
+    def _nehmen(self, fcntl):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        self.gehalten = True
+        Bausperre.offen = self.fd
+        return True
+
+    def _frei(self):
+        if self.fd is not None:
+            if Bausperre.offen == self.fd:
+                Bausperre.offen = None
+            os.close(self.fd)  # gibt die Sperre frei, wenn kein Bau sie mehr geerbt hat
+            self.fd = None
+
+    def __exit__(self, *_):
+        self._frei()
+        return False
+
+
+class Wache:
+    """Solange „app“ einen Bau, einen Server oder seite-pruefen laufen hat: SIGTERM, SIGHUP und SIGINT lösen SystemExit
+    aus, statt „app“ sofort zu beenden. So läuft das Aufräumen in finally auch bei einem Abbruch von außen. Während des
+    Aufräumens (ruhe()) werden weitere Signale nur gemerkt; danach endet „app“ wie verlangt. Ein Signal, das schon beim
+    Start von „app“ überhört wurde (etwa unter nohup), bleibt überhört."""
+
+    def __enter__(self):
+        self.alt, self.ruhig, self.gemerkt = {}, False, None
+        for name in ('SIGTERM', 'SIGHUP', 'SIGINT'):
+            nummer = getattr(signal, name, None)
+            if nummer is None:
+                continue
+            vorher = signal.getsignal(nummer)
+            if vorher is None or vorher == signal.SIG_IGN:
+                continue
+            try:
+                signal.signal(nummer, self._signal)
+                self.alt[nummer] = vorher
+            except (OSError, ValueError):  # zum Beispiel nicht im Hauptthread
+                pass
+        return self
+
+    def _signal(self, nummer, _rahmen):
+        if self.ruhig:
+            self.gemerkt = self.gemerkt or nummer
+            return
+        self.ruhig = True
+        raise SystemExit(128 + nummer)
+
+    def ruhe(self):
+        self.ruhig = True
+
+    def __exit__(self, art, *_):
+        for nummer, vorher in self.alt.items():
+            signal.signal(nummer, vorher)
+        if self.gemerkt and art is None:
+            raise SystemExit(128 + self.gemerkt)
+        return False
+
+
+def _vor_dem_start(eltern):
+    """Läuft im neuen Prozess, bevor das Programm startet (Linux). Endet „app“ unerwartet, auch durch kill -9, schickt
+    das System dem Prozess SIGTERM (PR_SET_PDEATHSIG). So bleibt auch dann kein Server und kein Browser zurück."""
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        signal_nummer = ctypes.c_ulong(int(signal.SIGTERM))
+    except Exception:  # ohne libc: dann ohne diese Absicherung
+        prctl = None
+
+    def vorbereiten():
+        if prctl is not None:
+            prctl(ctypes.c_int(1), signal_nummer)  # 1 = PR_SET_PDEATHSIG
+        if os.getppid() != eltern:  # „app“ war schon weg, bevor die Regel galt
+            os._exit(1)
+    return vorbereiten
+
+
+def gruppe_starten(befehl, cwd, env, ausgabe, erben=()):
+    """Startet befehl in einer eigenen Prozessgruppe (eigene Sitzung): So lassen sich das Programm und alles, was es
+    startet, gezielt beenden, ohne „app“ selbst zu treffen. Ausgabe und Fehler gehen in die offene Datei ausgabe.
+    erben: offene Dateinummern, die das Programm und alles, was es startet, behalten (die Bausperre für den Bau)."""
+    return subprocess.Popen(befehl, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=ausgabe,
+                            stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=_vor_dem_start(os.getpid()),
+                            pass_fds=tuple(erben))
+
+
+def _nachfahren(wurzel):
+    """Alle Nachfahren des Prozesses wurzel als Liste aus (Prozessnummer, Prozessgruppe), gelesen aus PROC (Linux).
+    Ohne PROC (anderes System) ist die Liste leer."""
+    try:
+        namen = os.listdir(PROC)
+    except OSError:
+        return []
+    kinder = {}
+    for name in namen:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(PROC, name, 'stat'), 'rb') as f:
+                zeile = f.read().decode('utf-8', 'replace')
+            # Feld 2 ist der Programmname in Klammern; er darf selbst Klammern und Leerzeichen enthalten
+            felder = zeile[zeile.rindex(')') + 1:].split()
+            kinder.setdefault(int(felder[1]), []).append((int(name), int(felder[2])))
+        except (OSError, ValueError, IndexError):
+            continue  # der Prozess ist inzwischen weg
+    ergebnis, offen = [], [wurzel]
+    while offen:
+        for pid, gruppe in kinder.pop(offen.pop(), ()):
+            ergebnis.append((pid, gruppe))
+            offen.append(pid)
+    return ergebnis
+
+
+def fremde_gruppen(fuehrer):
+    """Prozessgruppen von Nachfahren des Prozesses fuehrer, die nicht in seiner Gruppe laufen. So startet puppeteer
+    Chromium unter Linux: in einer eigenen Gruppe. os.killpg auf die Gruppe von seite-pruefen erreicht es dann nicht."""
+    eigene = os.getpgrp() if hasattr(os, 'getpgrp') else None
+    return {g for _, g in _nachfahren(fuehrer) if g > 1 and g not in (fuehrer, eigene)}
+
+
+def _leer_nach(gruppe, frist, p=None):
+    """Wartet höchstens frist Sekunden, bis in der Prozessgruppe niemand mehr läuft. Rückgabe: True, wenn sie leer ist."""
+    ende = time.monotonic() + frist
+    while time.monotonic() < ende:
+        if p is not None:
+            p.poll()  # den Anführer abholen, sonst zählt er als Zombie weiter zur Gruppe
+        try:
+            os.killpg(gruppe, 0)
+        except OSError:  # ProcessLookupError: niemand mehr in der Gruppe
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def gruppe_beenden(p, frist=5):
+    """Beendet die Prozessgruppe von p samt allem darin: zuerst SIGTERM an alle, nach frist Sekunden SIGKILL an die,
+    die noch laufen. Auch nach einem normalen Ende von p aufrufen: Dann trifft es Kinder, die noch übrig sind.
+    Nachfahren in einer eigenen Gruppe (Chromium) merkt es sich vor jedem Signal, solange sie noch unter p hängen, und
+    beendet danach auch deren Gruppen genauso. Sonst bliebe Chromium übrig, wenn seite-pruefen erst SIGKILL beendet."""
+    if p is None:
+        return
+    fremde = set()
+    for nummer in (signal.SIGTERM, signal.SIGKILL):
+        fremde |= fremde_gruppen(p.pid)
+        try:
+            os.killpg(p.pid, nummer)
+        except OSError:  # ProcessLookupError: niemand mehr in der Gruppe
+            break
+        if _leer_nach(p.pid, frist, p):
+            break
+    p.poll()
+    for gruppe in sorted(fremde):
+        for nummer in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(gruppe, nummer)
+            except OSError:  # schon weg (puppeteer beendet Chromium selbst, wenn seite-pruefen auf SIGTERM endet)
+                break
+            if _leer_nach(gruppe, frist):
+                break
+
+
+def bau_lauf(befehl, o, log):
+    """npm ci oder npm run build im Ordner o, Ausgabe nach log. Hält „app“ die Bausperre, läuft der Befehl in einer
+    eigenen Prozessgruppe (gruppe_starten) und erbt die Sperre. Bricht „app“ ab (SIGTERM, SIGHUP, SIGINT), endet der
+    Bau samt allem, was er gestartet hat; erst danach ist die Sperre frei. Endet „app“ hart (kill -9), bekommt der Bau
+    SIGTERM, und was davon noch läuft, hält die geerbte Sperre bis zuletzt: So baut nie ein zweiter daneben.
+    Ohne gehaltene Sperre (sie ging nicht, oder kein Linux) wie lauf(). Rückgabe: Rückgabewert des Befehls."""
+    if Bausperre.offen is None:
+        return lauf(befehl, o, log)
+    env = _umgebung_ohne_geheimes()
+    env['NEXT_TELEMETRY_DISABLED'] = '1'  # wie im Dockerfile der Vorlage (sonst startet next build womöglich mehr)
+    p = None
+    with Wache() as wache, open(log, 'w') as f:
+        try:
+            try:
+                p = gruppe_starten(befehl, o, env, f, erben=(Bausperre.offen,))
+            except OSError as x:
+                f.write(f'{befehl[0]} ließ sich nicht starten ({x.strerror or x}).\n')
+                return 127
+            while p.poll() is None:  # in kurzen Schritten warten: So greift ein Abbruch von außen sofort
+                time.sleep(0.2)
+            return p.returncode
+        finally:
+            wache.ruhe()
+            gruppe_beenden(p)  # auch nach einem normalen Ende: Was vom Bau noch übrig ist, endet mit
+
+
+def dauer(sekunden):
+    return f'{round(sekunden / 60)} Minuten' if sekunden >= 120 else f'{int(sekunden)} Sekunden'
+
+
+def letzte_zeilen(pfad, anzahl):
+    try:
+        with open(pfad, encoding='utf-8', errors='replace') as f:
+            return ''.join(f.readlines()[-anzahl:])
+    except OSError:
+        return ''
+
+
+def seite_pruefen_aufrufen(adresse, schritte=None, kurzname=None, lokal=False, sperre=False):
+    """Ruft seite-pruefen in einer eigenen Prozessgruppe auf. Rückgabe: (Rückgabewert, Ausgabe); Rückgabewert None
+    heißt: nach der Notbremse nicht fertig, seite-pruefen ist dann samt Browser beendet.
+    lokal: „app“ prüft die eigene Ansicht auf 127.0.0.1, dann steht SEITE_PRUEFEN_LOKAL=1 in der Umgebung.
+    sperre: „app“ hält die Bausperre. Dann steht BUILDBAR_SPERRE_GEHALTEN=1 in der Umgebung, und seite-pruefen nimmt
+    die Sperre nicht noch einmal (sonst warteten beide aufeinander). So erbt auch kein Browser eine Sperre."""
+    befehl = ['seite-pruefen', adresse]
+    if schritte:
+        befehl += ['--schritte', schritte]
+    if kurzname:
+        befehl += ['--name', kurzname]
+    env = _umgebung_ohne_geheimes()
+    env.pop('BUILDBAR_SPERRE_GEHALTEN', None)
+    env.pop('SEITE_PRUEFEN_LOKAL', None)
+    if sperre:
+        env['BUILDBAR_SPERRE_GEHALTEN'] = '1'
+    if lokal:
+        env['SEITE_PRUEFEN_LOKAL'] = '1'
+    # Ohne gehaltene Sperre wartet seite-pruefen womöglich erst auf einen anderen Bau: Die Wartezeit kommt dazu.
+    zeit = (SEITE_ZEIT_SCHRITTE if schritte else SEITE_ZEIT) + (0 if sperre else SPERRE_WARTEN)
+    p = None
+    with Wache() as wache, tempfile.TemporaryFile() as ausgabe:
+        try:
+            try:
+                p = gruppe_starten(befehl, None, env, ausgabe)
+            except OSError as x:
+                return 127, f'FEHLER: seite-pruefen ließ sich nicht starten ({x.strerror or x}).'
+            ende = time.monotonic() + zeit
+            while p.poll() is None and time.monotonic() < ende:
+                time.sleep(0.2)
+            rc = p.poll()
+        finally:
+            wache.ruhe()
+            gruppe_beenden(p)  # auch nach einem normalen Ende: Was seite-pruefen gestartet hat, endet mit
+        ausgabe.seek(0)
+        text = ausgabe.read().decode('utf-8', 'replace').replace('\r\n', '\n')
+    if rc is None:
+        text = text.rstrip() + f'\nDie Prüfung im Browser war nach {dauer(zeit)} nicht fertig. Ich habe sie beendet.'
+    return rc, text
+
+
+def _ordner_kopieren(quelle, ziel):
+    """Wie COPY im Dockerfile der Vorlage: den Ordner quelle nach ziel kopieren (ziel vorher leeren)."""
+    if not os.path.isdir(quelle):
+        return
+    if os.path.islink(ziel) or os.path.isfile(ziel):
+        os.unlink(ziel)
+    elif os.path.isdir(ziel):
+        shutil.rmtree(ziel)
+    shutil.copytree(quelle, ziel)
+
+
+def startbefehl(o, port):
+    """Womit die gebaute App startet: so wie im Betrieb (Dockerfile der Vorlage) mit node server.js aus
+    .next/standalone, daneben public und .next/static. Ohne diesen Build (anderes next.config) mit next start.
+    Rückgabe: (Befehl, Ordner) oder (None, None)."""
+    eigen = os.path.join(o, '.next', 'standalone')
+    if os.path.isfile(os.path.join(eigen, 'server.js')):
+        _ordner_kopieren(os.path.join(o, 'public'), os.path.join(eigen, 'public'))
+        _ordner_kopieren(os.path.join(o, '.next', 'static'), os.path.join(eigen, '.next', 'static'))
+        return ['node', 'server.js'], eigen
+    nxt = os.path.join(o, 'node_modules', 'next', 'dist', 'bin', 'next')
+    if os.path.isfile(nxt):
+        return ['node', nxt, 'start', '--hostname', '127.0.0.1', '--port', str(port)], o
+    return None, None
+
+
+def freier_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+class _NurHierher(urllib.request.HTTPRedirectHandler):
+    """Folgt einer Weiterleitung nur auf derselben Adresse (127.0.0.1 oder localhost mit demselben Port). Eine
+    Weiterleitung woandershin verfolgt es nicht: Dann gilt sie selbst als Antwort der Startseite, ziel nennt das Ziel."""
+
+    def __init__(self, port):
+        self.port, self.ziel = port, None
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            teile = urllib.parse.urlsplit(newurl)
+            hier = teile.scheme == 'http' and teile.hostname in ('127.0.0.1', 'localhost') and teile.port == self.port
+        except ValueError:  # etwa ein ungültiger Port
+            hier = False
+        if hier:
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+        self.ziel = newurl[:200]
+        return None  # urllib meldet dann die Weiterleitung selbst als HTTPError mit ihrem Status
+
+
+def erste_antwort(adresse, server):
+    """Wartet höchstens START_WARTEN Sekunden, bis die gestartete App unter adresse antwortet. Weiterleitungen folgt es
+    nur auf derselben Adresse (_NurHierher). Rückgabe: (HTTP-Status der Startseite, None, Ziel einer Weiterleitung
+    woandershin oder None) oder (None, warum keine Antwort kam, None)."""
+    weiter = _NurHierher(urllib.parse.urlsplit(adresse).port)
+    oeffner = urllib.request.build_opener(urllib.request.ProxyHandler({}), weiter)  # 127.0.0.1 nie über einen Proxy
+    ende = time.monotonic() + START_WARTEN
+    while True:
+        if server.poll() is not None:
+            return None, 'Die App hat sich beim Start beendet.', None
+        rest = ende - time.monotonic()
+        if rest <= 0:
+            return None, f'Die App antwortet nach {START_WARTEN} Sekunden nicht.', None
+        try:
+            with oeffner.open(adresse, timeout=max(1.0, min(30.0, rest))) as r:
+                return r.status, None, None
+        except urllib.error.HTTPError as e:
+            e.close()
+            return e.code, None, weiter.ziel
+        except Exception:  # noch nicht bereit (Verbindung abgelehnt), oder die Zeit für diese Anfrage ist um
+            time.sleep(0.5)
+
+
+def ansicht(o, schritte=None, kurzname=None, bereit=None):
+    """Die gebaute App hier im Arbeitsplatz ansehen, ohne sie zu veröffentlichen: auf 127.0.0.1 an einem freien Port
+    starten (startbefehl), auf die erste Antwort warten (erste_antwort), dann seite-pruefen mit dieser Adresse. Der
+    Server und alles, was er gestartet hat, endet danach in jedem Fall, auch bei Fehlern und Abbruch.
+    Nur aufrufen, während „app“ die Bausperre hält. bereit(status, weiter) läuft, sobald die App antwortet.
+    Rückgabe: dict mit technik (die Ansicht ging aus technischen Gründen nicht), start (die App startet nicht oder
+    antwortet nicht), status (HTTP-Status der Startseite), weiter (die Startseite leitet woandershin: Ziel), rc und
+    bericht (von seite-pruefen), protokoll (Ende des Protokolls der App)."""
+    e = {'technik': None, 'start': None, 'status': None, 'weiter': None, 'rc': None, 'bericht': '', 'protokoll': '',
+         'protokoll_pfad': f'/tmp/buildbar-ansicht-{os.path.basename(o)}.log'}
+    port = freier_port()
+    try:
+        befehl, cwd = startbefehl(o, port)
+    except OSError as x:
+        e['technik'] = f'Die gebaute App ließ sich nicht vorbereiten ({x.strerror or x}).'
+        return e
+    if not befehl:
+        e['technik'] = 'Im Ordner der App fehlt, womit die gebaute App startet (.next/standalone/server.js oder next).'
+        return e
+    env = _umgebung_ohne_geheimes()
+    env.update({'PORT': str(port), 'HOSTNAME': '127.0.0.1', 'NODE_ENV': 'production', 'NEXT_TELEMETRY_DISABLED': '1'})
+    adresse = f'http://127.0.0.1:{port}'
+    server = None
+    with Wache() as wache, open(e['protokoll_pfad'], 'wb') as protokoll:
+        try:
+            try:
+                server = gruppe_starten(befehl, cwd, env, protokoll)
+            except OSError as x:
+                e['technik'] = f'Die gebaute App ließ sich nicht starten ({x.strerror or x}).'
+                return e
+            e['status'], e['start'], e['weiter'] = erste_antwort(adresse + '/', server)
+            if e['start'] is None:
+                if bereit:
+                    bereit(e['status'], e['weiter'])
+                e['rc'], e['bericht'] = seite_pruefen_aufrufen(adresse, schritte, kurzname, lokal=True,
+                                                               sperre=Bausperre.offen is not None)
+        finally:
+            wache.ruhe()
+            gruppe_beenden(server)
+    e['protokoll'] = letzte_zeilen(e['protokoll_pfad'], 20)
+    return e
+
+
+def startseite(status, weiter=None):
+    if weiter:
+        return f'Achtung: Die Startseite antwortet mit HTTP {status} statt 200 und leitet woandershin weiter: {weiter}'
+    return ('Die Startseite antwortet (HTTP 200).' if status == 200
+            else f'Achtung: Die Startseite antwortet mit HTTP {status} statt 200.')
+
+
+def browser_fertig(bericht):
+    """Hat seite-pruefen die Seite ganz geprüft? Dann steht im Bericht die Zeile „Fehler im Browser“, auch wenn der
+    Rückgabewert nicht 0 ist (etwa 2, weil ein Schritt abgelehnt wurde). Sonst steht dort nur eine Meldung FEHLER."""
+    return any(z.startswith('Fehler im Browser') for z in bericht.splitlines())
+
+
+def _ende_vor_text(zeilen):
+    """Wo im Bericht von seite-pruefen der sichtbare Text der Seite beginnt: bei der letzten Zeile „Sichtbarer Text …“.
+    Meldungen der Seite (Konsole, Skriptfehler) können Zeilenumbrüche enthalten und so selbst eine solche Zeile
+    vortäuschen. Mit der letzten bleibt davor kein echter Eintrag unbeachtet."""
+    return max((i for i, z in enumerate(zeilen) if z.startswith('Sichtbarer Text')), default=len(zeilen))
+
+
+def bericht_kurz(text):
+    """Der Bericht von seite-pruefen ohne den sichtbaren Text der Seite und ohne den Rat zum nächsten Schritt."""
+    zeilen = text.rstrip().splitlines()
+    zeilen = zeilen[:_ende_vor_text(zeilen)]
+    return '\n'.join(z for z in zeilen if not z.startswith('Nächster Schritt')).strip('\n')
+
+
+def fehler_im_browser(bericht):
+    """Die Einträge unter „Fehler im Browser:“ im Bericht von seite-pruefen (ohne die zwei Leerzeichen davor). Gesucht
+    wird von der ersten Zeile „Fehler im Browser“ bis vor den sichtbaren Text (_ende_vor_text). Ein Eintrag beginnt mit
+    zwei Leerzeichen und einem Zeichen; Folgezeilen einer Meldung mit Zeilenumbruch zählen nicht als eigener Eintrag.
+    Mehr als FEHLER_MAX Einträge zeigt seite-pruefen nicht."""
+    zeilen = bericht.splitlines()
+    anfang = next((i for i, z in enumerate(zeilen) if z.startswith('Fehler im Browser')), None)
+    if anfang is None:
+        return []
+    ende = _ende_vor_text(zeilen)
+    if ende <= anfang:
+        ende = len(zeilen)
+    return [z[2:] for z in zeilen[anfang + 1:ende] if re.match(r'  \S', z)]
+
+
+def bilder(bericht):
+    """Die Pfade der beiden Bilder im Bericht von seite-pruefen: aus der ersten Zeile „Rechner (1280 px): Bild
+    <stamm>-rechner.png“ und aus der Zeile „Handy (390 px): Bild <stamm>-handy.png“ mit demselben Stamm. Andere Pfade
+    (aus Fehlermeldungen, Tabellenköpfen oder dem Text der Seite) zählen nicht."""
+    zeilen = bericht.splitlines()
+    stamm = next((m.group(1) for m in (re.match(r'Rechner \(\d+ px\): Bild (\S+)-rechner\.png$', z) for z in zeilen)
+                  if m), None)
+    if stamm is None:
+        return []
+    handy = re.compile(r'Handy \(\d+ px\): Bild ' + re.escape(stamm) + r'-handy\.png$')
+    return [stamm + '-rechner.png'] + ([stamm + '-handy.png'] if any(handy.match(z) for z in zeilen) else [])
+
+
+def bauen(o):
+    """npm run build im Ordner der App, vorher npm ci, wenn node_modules fehlt. Nur mit gehaltener Bausperre aufrufen.
+    Beides läuft über bau_lauf (eigene Prozessgruppe, erbt die Sperre). Scheitert der Build, endet „app“ mit den
+    letzten Zeilen des Protokolls."""
+    if not os.path.isdir(os.path.join(o, 'node_modules')):
+        platz_schaffen(o)
+        bau_lauf(['npm', 'ci', '--no-audit', '--no-fund'], o, '/tmp/npm-ci.log')
+    if bau_lauf(['npm', 'run', 'build'], o, '/tmp/build.log') != 0:
+        raus('BUILD FEHLGESCHLAGEN. Die letzten Zeilen:\n' + letzte_zeilen('/tmp/build.log', 40))
+
+
+def ansehen(name=None, schritte=None, kurzname=None):
+    """„app ansehen“: bauen, die gebaute App hier kurz starten und im Browser prüfen, ohne zu veröffentlichen.
+    Ersetzt jede eigene Vorschau (npm run dev, npm start, ein Server im Hintergrund)."""
+    o = ordner_von(name)
+    with Bausperre():
+        print('1/3 Prüfe den Build (npm run build) ...', flush=True)
+        bauen(o)
+        print('2/3 Starte die gebaute App hier im Arbeitsplatz, nur zum Ansehen ...', flush=True)
+
+        def bereit(status, weiter=None):
+            print(startseite(status, weiter), flush=True)
+            print('3/3 Öffne die Seite im Browser und mache die Bilder ...', flush=True)
+        e = ansicht(o, schritte, kurzname or os.path.basename(o), bereit)
+    schluss = ('Die App läuft hier jetzt nicht mehr, veröffentlicht ist nichts. Die Adresse mit 127.0.0.1 gilt nur für '
+               'diese Prüfung: Gib sie nicht weiter.')
+    if e['technik']:
+        raus('Die Ansicht ging nicht: ' + e['technik'])
+    if e['start']:
+        protokoll = e['protokoll'].rstrip()
+        raus(f"Die gebaute App startet hier nicht. {e['start']}\n"
+             + (f"Die letzten Zeilen ihres Protokolls ({e['protokoll_pfad']}):\n{protokoll}\n" if protokoll else '')
+             + 'Behebe den Fehler und ruf „app ansehen“ noch einmal auf.')
+    print(e['bericht'].rstrip())
+    if not browser_fertig(e['bericht']):
+        raus('Die Prüfung im Browser ging nicht (Meldung oben). ' + schluss)
+    print(schluss)
+
+
+def vorpruefung(o):
+    """Schritt 2 von „app veroeffentlichen“: dieselbe Ansicht wie „app ansehen“, ohne Schritte, bevor etwas übertragen
+    wird. Harte Befunde halten das Veröffentlichen an: Die Startseite antwortet nicht mit 200 (auch: sie leitet
+    woandershin weiter), oder die Seite wirft beim Laden einen Fehler im Browser (ein Eintrag „Skriptfehler: …“ unter
+    „Fehler im Browser“ im Bericht von seite-pruefen, siehe fehler_im_browser). Befunde zur Darstellung (zu breit,
+    Kontrast, Tabellenspalten) und Meldungen der Konsole sind Hinweise. Geht die Prüfung selbst nicht (kein Browser,
+    Zeitüberschreitung, Abbruch zum Schutz vor internen Adressen), ist das ebenfalls ein Hinweis, kein Abbruch."""
+    e = ansicht(o, kurzname=os.path.basename(o) + '-vorpruefung',
+                bereit=lambda status, weiter=None: print('    ' + startseite(status, weiter), flush=True))
+    if e['technik']:
+        print('    Hinweis: Die Vorprüfung ging nicht. ' + e['technik'] + ' Ich mache ohne sie weiter.', flush=True)
+        return
+    hart = []
+    if e['start']:
+        hart.append('Die Startseite antwortet nicht. ' + e['start'])
+    elif e['weiter']:
+        hart.append(f"Die Startseite antwortet mit HTTP {e['status']} statt 200 und leitet woandershin weiter: "
+                    f"{e['weiter']}")
+    elif e['status'] != 200:
+        hart.append(f"Die Startseite antwortet mit HTTP {e['status']} statt 200.")
+    kurz = bericht_kurz(e['bericht'])
+    if kurz:
+        print('\n'.join('    ' + z for z in kurz.splitlines()), flush=True)
+    if e['start'] is None and browser_fertig(e['bericht']):
+        eintraege = fehler_im_browser(e['bericht'])
+        fehler = [z for z in eintraege if z.startswith('Skriptfehler: ')]
+        if fehler:
+            hart.append('Die Seite wirft beim Laden einen Fehler im Browser: ' + '; '.join(fehler[:3]))
+        elif len(eintraege) >= FEHLER_MAX:
+            print(f'    Hinweis: Im Browser gab es mindestens {FEHLER_MAX} Fehler, mehr zeigt seite-pruefen nicht. Ob die '
+                  'Seite dazu noch einen Skriptfehler wirft, ist so nicht zu sehen. Behebe am besten zuerst diese Fehler.',
+                  flush=True)
+    elif e['start'] is None and not hart:
+        print('    Hinweis: Die Prüfung im Browser ging nicht (Meldung oben). Ich mache ohne sie weiter.', flush=True)
+        return
+    if hart:
+        text = 'VORPRÜFUNG NICHT BESTANDEN. Veröffentlicht wurde nichts.\n' + '\n'.join('- ' + h for h in hart)
+        protokoll = e['protokoll'].rstrip()
+        if e['start'] and protokoll:
+            text += f"\nDie letzten Zeilen aus dem Protokoll der App ({e['protokoll_pfad']}):\n{protokoll}"
+        raus(text + '\nBehebe das und ruf „app veroeffentlichen“ noch einmal auf. „app ansehen“ zeigt die Seite, '
+                    'ohne zu veröffentlichen.')
+    print('    Vorprüfung bestanden: keine harten Fehler. Was oben sonst steht, sind Hinweise.', flush=True)
+
+
+def echte_seite_pruefen(adresse, schritte=None):
+    """Schritt 6 von „app veroeffentlichen“: seite-pruefen auf die echte Adresse, mit den Schritten, wenn angegeben.
+    Ändert nichts am Ergebnis: Die Seite ist live, auch wenn die Prüfung Hinweise hat oder nicht geht.
+    „app“ nimmt dafür selbst die Bausperre: So steht ein Warten auf einen anderen Bau gleich hier, und der Browser von
+    seite-pruefen erbt keine Sperre (er läuft in einer eigenen Gruppe und könnte sie sonst über sein Ende hinaus halten)."""
+    print('6/6 Prüfe die Seite unter der echten Adresse ...', flush=True)
+    with Bausperre(zeitende=None) as sperre:
+        if sperre.gehalten is False:
+            print('Hinweis: Die Prüfung der echten Seite habe ich ausgelassen, weil der andere Bau nach 15 Minuten noch '
+                  f'nicht fertig ist. Die Seite ist trotzdem live. Später prüfen: seite-pruefen {adresse}')
+            return
+        try:
+            rc, text = seite_pruefen_aufrufen(adresse, schritte, sperre=bool(sperre.gehalten))
+        except Exception as x:
+            rc, text = 1, f'FEHLER: {x}'
+    print(text.rstrip())
+    if not browser_fertig(text):
+        print('Hinweis: Die Prüfung der echten Seite ging nicht (Meldung oben). Die Seite ist trotzdem live. '
+              f'Noch einmal prüfen: seite-pruefen {adresse}')
+    pfade = bilder(text)
+    if pfade:
+        print('Bilder: ' + ', '.join(pfade))
+
+
+def veroeffentlichen(name=None, nachricht='Aktualisierung', schritte=None, vorpruefen=True):
     o = ordner_von(name)
     m = meta(o)
     adresse = m['adresse']
-    print('1/4 Prüfe den Build (npm run build) ...', flush=True)
-    if not os.path.isdir(os.path.join(o, 'node_modules')):
-        platz_schaffen(o)
-        lauf(['npm', 'ci', '--no-audit', '--no-fund'], o, '/tmp/npm-ci.log')
-    if lauf(['npm', 'run', 'build'], o, '/tmp/build.log') != 0:
-        with open('/tmp/build.log') as f:
-            raus('BUILD FEHLGESCHLAGEN. Die letzten Zeilen:\n' + ''.join(f.readlines()[-40:]))
+    with Bausperre():
+        print('1/6 Prüfe den Build (npm run build) ...', flush=True)
+        bauen(o)
+        if vorpruefen:
+            print('2/6 Prüfe die gebaute Seite hier im Arbeitsplatz, bevor etwas übertragen wird ...', flush=True)
+            vorpruefung(o)
+        else:
+            print('2/6 Vorprüfung übersprungen (--ohne-vorpruefung).', flush=True)
     marke = f'{int(time.time())}-{random.randint(1000, 9999)}'
     os.makedirs(os.path.join(o, 'public'), exist_ok=True)
     with open(os.path.join(o, 'public', 'version.txt'), 'w') as f:
@@ -250,11 +935,11 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung'):
     c = lauf(['git', 'commit', '-q', '-m', nachricht], o)
     if c.returncode != 0 and 'nothing to commit' not in (c.stdout + c.stderr):
         raus('COMMIT FEHLGESCHLAGEN: ' + (c.stderr or c.stdout)[-400:])
-    print('2/4 Übertrage den Stand nach Gitea ...', flush=True)
+    print('3/6 Übertrage den Stand nach Gitea ...', flush=True)
     r = lauf(['git', 'push', '-q', 'origin', 'HEAD:main'], o)
     if r.returncode != 0:
         raus('PUSH FEHLGESCHLAGEN: ' + re.sub(r'//[^@/]+@', '//', r.stderr)[-400:])
-    print('3/4 Coolify baut die App neu (meist 2 bis 5 Minuten) ...', flush=True)
+    print('4/6 Coolify baut die App neu (meist 2 bis 5 Minuten) ...', flush=True)
     angestossen = False
     for i in range(72):
         time.sleep(10)
@@ -264,11 +949,12 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung'):
         except Exception:
             ist = ''
         if ist == marke:
-            print(f'4/4 LIVE nach {(i + 1) * 10} Sekunden: {adresse}')
-            fehlt = offen_vor_abschluss(o)
-            if fehlt:
-                print('Hinweis: Vor dem Abschluss fehlt noch: ' + '; '.join(fehlt) + '. '
-                      'Alle vier Pflichtschritte (n8n-testdaten, n8n-dokumentation, n8n-security-audit, pruefbericht) gehören dazu.')
+            print(f'5/6 LIVE nach {(i + 1) * 10} Sekunden: {adresse}', flush=True)
+            echte_seite_pruefen(adresse, schritte)
+            hinweis = erinnerung(o)
+            if hinweis:
+                print(ZUERST_SAGEN.format(a=adresse))
+                print(hinweis)
             return
         if i == 23 and not angestossen:
             s, _ = hub('POST', f'/apps/{os.path.basename(o)}/deploy')
@@ -277,13 +963,69 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung'):
     raus(f'Nach 12 Minuten noch nicht live. „app status“ zeigt den Stand des Builds. Adresse: {adresse}', 2)
 
 
+def optionen(argumente, mit_wert=(), schalter=()):
+    """Trennt --optionen von den übrigen Angaben. Rückgabe: (übrige Angaben, {Option: Wert oder True}).
+    Eine Angabe mit Leerzeichen (etwa die Nachricht) gilt nie als Option."""
+    uebrig, werte, i = [], {}, 0
+    while i < len(argumente):
+        a = argumente[i]
+        name, gleich, wert = a.partition('=')
+        if name in mit_wert:
+            if not gleich:
+                if i + 1 >= len(argumente) or argumente[i + 1].startswith('--'):
+                    raus(f'Nach {name} fehlt die Angabe. „app hilfe“ zeigt, wie es geht.')
+                i += 1
+                wert = argumente[i]
+            werte[name] = wert
+        elif a in schalter:
+            werte[a] = True
+        elif a.startswith('--') and ' ' not in a:
+            raus(f'„{a}“ kenne ich nicht. „app hilfe“ zeigt, was geht.')
+        else:
+            uebrig.append(a)
+        i += 1
+    return uebrig, werte
+
+
+def schritte_datei(pfad):
+    """Prüft die Datei mit den Schritten für seite-pruefen, bevor gebaut wird: eine normale Datei (keine FIFO, kein
+    Gerät wie /dev/zero) mit höchstens SCHRITTE_MAX Bytes und gültigem JSON. Rückgabe: voller Pfad."""
+    p = os.path.abspath(os.path.expanduser(pfad))
+    try:
+        st = os.stat(p)
+        if not stat.S_ISREG(st.st_mode):
+            raus(f'Das ist keine normale Datei: {p}. Die Schritte gehören in eine JSON-Datei, das Format zeigt '
+                 '„seite-pruefen hilfe“.')
+        if st.st_size > SCHRITTE_MAX:
+            raus(f'Die Datei mit den Schritten ist zu groß ({st.st_size // 1000} KB, erlaubt sind '
+                 f'{SCHRITTE_MAX // 1000} KB): {p}')
+        with open(p, encoding='utf-8') as f:
+            json.load(f)
+    except FileNotFoundError:
+        raus(f'Die Datei mit den Schritten gibt es nicht: {p}')
+    except ValueError as x:
+        raus(f'Die Schritte in {p} sind kein gültiges JSON (Zeile {getattr(x, "lineno", "?")}). '
+             'Das Format zeigt „seite-pruefen hilfe“.')
+    except OSError as x:
+        raus(f'Die Datei mit den Schritten lässt sich nicht lesen: {p} ({x.strerror or x})')
+    return p
+
+
 if __name__ == '__main__':
     a = sys.argv[1:]
     if not a or a[0] in ('hilfe', '-h', '--help'):
         raus(__doc__, 0)
+    befehl = a[0]
+    if befehl == 'ansehen':
+        # Ansehen braucht den Zugang zum Veröffentlichen nicht: Es wird nichts übertragen.
+        rest, opt = optionen(a[1:], ('--schritte', '--name'))
+        if len(rest) > 1:
+            raus('Zu viele Angaben. So geht es: app ansehen [<name>] [--schritte <datei.json>] [--name <kurzname>]')
+        ansehen(rest[0] if rest else None, schritte_datei(opt['--schritte']) if '--schritte' in opt else None,
+                opt.get('--name'))
+        sys.exit(0)
     if not TOKEN:
         raus('Der Zugang zum Veröffentlichen fehlt. „buildbar-status“ zeigt, was zu tun ist.')
-    befehl = a[0]
     if befehl == 'neu' and len(a) >= 2:
         neu(a[1], ' '.join(a[2:]))
     elif befehl == 'liste':
@@ -291,10 +1033,11 @@ if __name__ == '__main__':
     elif befehl == 'status':
         status(a[1] if len(a) > 1 else None)
     elif befehl == 'veroeffentlichen':
-        rest = a[1:]
+        rest, opt = optionen(a[1:], ('--schritte',), ('--ohne-vorpruefung',))
         name = rest[0] if rest and os.path.isdir(os.path.join(APPS, rest[0])) else None
         if name:
             rest = rest[1:]
-        veroeffentlichen(name, ' '.join(rest) or 'Aktualisierung')
+        schritte = schritte_datei(opt['--schritte']) if '--schritte' in opt else None
+        veroeffentlichen(name, ' '.join(rest) or 'Aktualisierung', schritte, not opt.get('--ohne-vorpruefung'))
     else:
         raus(__doc__)

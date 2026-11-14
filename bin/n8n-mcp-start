@@ -2,15 +2,28 @@
 # n8n-Verbindung des Assistenten (n8n-mcp über stdio). Die Standardausgabe gehört dem Protokoll,
 # alles andere geht ins Log /tmp/n8n-mcp.log, mit ausgeblendetem Schlüssel. Aufgerufen von n8n-werkzeug.
 . /opt/buildbar/schluessel-laden.sh
+# n8n-mcp ist ein fremdes Paket und braucht nur den n8n-Zugang. Das Zugangszeichen zum Veröffentlichen und die Nutzer-ID
+# bekommt es nicht: Mit ihnen und dem Kürzel könnte ein Programm beim Bereitstellungsdienst als die Person auftreten.
+# Vorsorglich auch nicht den Schlüssel des Terminals selbst: Open Terminal 0.11 gibt OPEN_TERMINAL_API_KEY an jeden
+# Befehl weiter. Ob die Fassung im Image das noch tut, ist nicht nachgesehen. Fehlt die Variable, ändert das nichts.
+unset OIL_HUB_TOKEN HUB_TOKEN PERSON_ID OPEN_TERMINAL_API_KEY
 export N8N_API_URL="${N8N_API_URL:-https://n8n.oi.destination.one}"
 export MCP_MODE=stdio
 export LOG_LEVEL=error
 export DISABLE_CONSOLE_OUTPUT=true
+# Keine Nutzungsdaten an den Hersteller von n8n-mcp: Ohne diesen Schalter schickt n8n-mcp genutzte Werkzeuge und
+# Inhalte der Workflows an dessen Server. Der Schalter steht auch als Standardwert im Dockerfile.
+export N8N_MCP_TELEMETRY_DISABLED=true
 # Im n8n-Konto der Person liegen auch andere Workflows, Ordner und Tabellen: kein Löschen, keine Zugänge, kein
 # Instanz-Audit, keine n8n-Agenten und Evaluations; Ordner nicht löschen, verschieben oder umbenennen (Löschen archiviert
-# die Workflows darin), Versionen nicht löschen oder zurückspielen, Ausführungen und Tabellen nicht löschen.
+# die Workflows darin), Versionen nicht löschen oder zurückspielen, Ausführungen, Tabellen und Tabellenzeilen nicht löschen.
 export DISABLED_TOOLS="n8n_delete_workflow,n8n_manage_credentials,n8n_audit_instance,n8n_manage_agents,n8n_evaluations"
-export DISABLED_TOOL_OPERATIONS="n8n_manage_folders:delete,move,rename;n8n_workflow_versions:delete,prune,rollback;n8n_executions:delete;n8n_manage_datatable:deletetable"
+export DISABLED_TOOL_OPERATIONS="n8n_manage_folders:delete,move,rename;n8n_workflow_versions:delete,prune,rollback;n8n_executions:delete;n8n_manage_datatable:deletetable,deleterows"
+# n8n-mcp lädt eine Datei .env aus dem Ordner, in dem es startet. Im Arbeitsordner des Assistenten könnte so eine Datei
+# die Zertifikatsprüfung, einen Proxy oder den Schutz vor internen Adressen umstellen. /opt/buildbar gehört root, dort
+# liegt keine .env. Der Wechsel gilt nur für n8n-mcp: n8n-werkzeug liest --datei selbst und bleibt im Ordner des
+# Assistenten, relative Pfade gehen also weiter.
+cd /opt/buildbar || exit 1
 if [ -n "${N8N_API_KEY:-}" ]; then
   # Fehlermeldungen können Anfragen samt Kopfzeilen enthalten: den Schlüssel vor dem Schreiben ins Log ersetzen
   exec n8n-mcp 2> >(BB_SCHLUESSEL="$N8N_API_KEY" python3 -u -c '

@@ -60,10 +60,17 @@ die 16 Skills `buildbar-*` (Arbeitsbereich, Skills).
 ## Was je Person passiert
 
 Das Home ist am Anfang leer. Bei jeder Nachricht an buildbar_ schreibt der Zusatz die Datei `~/.buildbar/zugang.env`
-ins Terminal der Person, falls sich etwas geändert hat. Darin stehen Kürzel, Nutzer-ID, die Adressen von n8n und dem
-Bereitstellungsdienst, ein persönliches Zugangszeichen zum Veröffentlichen (HMAC aus dem Kurs-Geheimnis, Kürzel und
-Nutzer-ID) und, sobald vorhanden, der n8n-Schlüssel der Person. Der Ordner ist versteckt, das Dateifenster blendet ihn
-aus, und buildbar_ öffnet ihn nie.
+ins Terminal der Person, wenn sich etwas geändert hat oder das letzte Schreiben länger als 10 Minuten her ist. Darin
+stehen Kürzel, Nutzer-ID, die Adressen von n8n und dem Bereitstellungsdienst, ein persönliches Zugangszeichen zum
+Veröffentlichen (HMAC aus dem Kurs-Geheimnis, Kürzel und Nutzer-ID) und, sobald vorhanden, der n8n-Schlüssel der
+Person. Der Ordner ist versteckt, das Dateifenster blendet ihn aus, und buildbar_ öffnet ihn nie.
+
+`buildbar-status` hält den Zusatz nur für aktiv, wenn diese Datei jünger als 30 Minuten ist. Ist sie älter, läuft der
+Zusatz vermutlich nicht mehr (abgeschaltet oder nicht mehr am Modell). Fehlt dann der n8n-Schlüssel, schickt
+`buildbar-status` die Person zur Betreuung, statt zum Einfügen in den Chat zu raten: Ohne den Zusatz fängt den
+Schlüssel dort niemand ab. Die Betreuung prüft in diesem Fall, ob der Zusatz aktiv ist und am Modell buildbar_ hängt.
+Die 10 Minuten stehen im Zusatz (`MERKER_DAUER`) und müssen unter den 30 Minuten bleiben. Wer den Zusatz so ändert,
+dass er die Datei seltener schreibt, schaltet sonst die Anleitung zum Einfügen für alle ab.
 
 **Die Person tut nur eins: ihren n8n-Schlüssel einmal hinterlegen.** buildbar_ sagt beim ersten Kontakt, wie
 (n8n, Einstellungen, n8n API, Schlüssel mit allen Rechten erstellen). Zwei Wege:
@@ -74,9 +81,9 @@ aus, und buildbar_ öffnet ihn nie.
    einem älteren oder geteilten Verlauf.
 2. Direkt eintragen: im Chat oben rechts „Steuerung“, „Valves“, „Funktionen“, „buildbar Zugang“.
 
-Das Kürzel bildet der Zusatz aus dem Namen: erster Buchstabe des Vornamens und Nachname (höchstens 9 Zeichen, ohne
-Umlaute) plus drei Zeichen aus der Nutzer-ID, zum Beispiel `bhillerbd5`. Es steht in Pfaden, Tabellennamen und
-App-Adressen.
+Das Kürzel bildet der Zusatz aus dem Namen: erster Buchstabe des Vornamens und Nachname (zusammen höchstens 7 Zeichen,
+ohne Umlaute), dazu 5 Zeichen aus der Nutzer-ID. Es ist damit höchstens 12 Zeichen lang, zum Beispiel `bhiller3fa9c`.
+Es steht in Pfaden, Tabellennamen und App-Adressen.
 
 Vor jedem Modellaufruf, auch zwischen zwei Werkzeugaufrufen, blendet der Zusatz n8n-Schlüssel und das Zugangszeichen
 der Person aus allen Nachrichten und Werkzeugausgaben aus. Nach der Antwort bereinigt er die gespeicherten
@@ -85,26 +92,46 @@ Schläft das Terminal beim ersten Kontakt, wartet der Zusatz mit einer Statusmel
 
 ## Zugänge und Bausteine
 
-buildbar_ nutzt die Zugänge (Credentials) im n8n-Konto der Person: eigene und solche, die für das Konto freigegeben
-sind. `buildbar-status` listet sie mit Name, Typ und ID. Dafür braucht der n8n-Schlüssel das Recht, Zugänge aufzulisten
-(`credential:list`). KI läuft über den n8n-Node von one.intelligence (`CUSTOM.lmChatOneIntelligence`, Zugang vom Typ
-`oneIntelligenceApi`), getestet mit `claude-sonnet-5-5`, `claude-haiku-5-5` und `local/gemma-4-31B`.
+Ein n8n-Schlüssel kann die Zugänge (Credentials) eines Kontos nicht auflisten: Unter seinen Rechten gibt es dafür
+keines. buildbar_ kommt deshalb auf zwei Wegen an Zugänge:
 
-Die fünf Bausteine (Google, Tripadvisor, OpenStreetMap, Website, Webseite lesen) sind ein Angebot, keine Pflicht. Sie
-liegen in einem n8n-Konto und sind für jeden Workflow der Instanz aufrufbar (`callerPolicy: any`). Sie laufen mit den
-Zugängen des Kontos, in dem sie liegen.
+- **Eigene Zugänge der Person**, zum Beispiel für die KI: buildbar_ baut den Node ohne Zugang, die Person wählt ihren
+  Zugang dort einmal aus und speichert. `buildbar-merken aus-workflow <Workflow-ID>` liest Name, Typ und Nummer aus dem
+  Workflow und merkt sie sich (`~/.config/buildbar/zugaenge.json`, keine Schlüssel). `buildbar-status` zeigt die
+  gemerkten Zugänge. KI läuft über den n8n-Node von one.intelligence (`CUSTOM.lmChatOneIntelligence`, Zugang vom Typ
+  `oneIntelligenceApi`), getestet mit `claude-sonnet-5-5`, `claude-haiku-5-5` und `local/gemma-4-31B`.
+- **DataForSEO und Apify** über zwei flexible Bausteine. Das sind n8n-Workflows im Konto der Betreuung mit deren
+  Zugängen. „Baustein: DataForSEO“ nimmt jede Abfrage an (Pfad und Anfrage frei), „Baustein: Apify“ startet jeden
+  Actor aus dem Apify Store. Beide haben ein Tageslimit für alle Aufrufer zusammen.
+
+Dazu kommen fünf fertige Bausteine für Öffnungszeiten und Webseiten (Google, Tripadvisor, OpenStreetMap, Website,
+Webseite lesen). Alle Bausteine sind ein Angebot, keine Pflicht, und für jeden Workflow der Instanz aufrufbar
+(`callerPolicy: any`). Sie laufen mit den Zugängen des Kontos, in dem sie liegen.
 
 ## Was im Image liegt
 
 | Pfad | Zweck |
 |---|---|
 | `/usr/local/bin/buildbar-status` | zeigt, was eingerichtet ist und was fehlt, ohne Schlüssel auszugeben |
+| `/usr/local/bin/buildbar-merken` | merkt sich Zugänge, die die Person in einem eigenen Workflow ausgewählt hat |
 | `/usr/local/bin/n8n-werkzeug` | ruft die n8n-mcp-Werkzeuge im n8n-Konto der Person auf |
-| `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge und Instanz-Audit) |
-| `/usr/local/bin/app` | App anlegen, auflisten, veröffentlichen (über den Bereitstellungsdienst) |
-| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy, Überbreite, Kontrast, Fehler |
-| `/opt/buildbar/` | `seite-pruefen.js`, `puppeteer-core`, `schluessel-laden.sh` |
+| `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge, Instanz-Audit, Agenten und Evaluations), ohne Telemetrie |
+| `/usr/local/bin/app` | App anlegen, auflisten, ansehen und veröffentlichen (über den Bereitstellungsdienst). `app ansehen` baut die App im Arbeitsplatz, startet sie nur lokal und prüft sie im Browser, ohne etwas zu veröffentlichen. `app veroeffentlichen` prüft vorher lokal und danach die echte Adresse. Es läuft immer nur ein Bau (Sperre `/tmp/buildbar-bau.lock`, der Arbeitsplatz hat 2 GB) |
+| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy (am Handy wie ein echtes Gerät neu geladen), Überbreite, Kontrast, Fehler. Schritt `datei` lädt eine Datei aus dem Ordner der App oder aus `/tmp` in ein Dateifeld. Nur eigene Apps und, mit `SEITE_PRUEFEN_LOKAL=1`, die lokal gestartete App; interne Adressen sind gesperrt |
+| `/usr/local/bin/workflow-pruefen` | prüft einen n8n-Workflow auf stille Fehler (Name, Ausdruck ohne „=“, Webhook und Antwort, offene Weiterleitung, Kosten ohne Tageszähler, Code, KI, Zugänge) |
+| `/usr/local/bin/datei-ansehen` | liest eine angehängte Tabelle ganz (Spalten, Summen, Kontrollzeilen) und blendet Personendaten aus, bevor geplant wird |
+| `/usr/local/bin/seite-ansehen` | sieht eine fremde öffentliche Webseite einmal im Browser an: Bild, Hausfarben mit Kontrast, Logo-Kandidaten, Navigation, Text |
+| `/opt/buildbar/` | `seite-pruefen.js`, `seite-ansehen.js`, `puppeteer-core`, `schluessel-laden.sh` |
 | aus dem Basis-Image | Node 22, Python 3.12, Git, Chromium, curl, sudo |
+
+Zu `n8n-mcp-start`: Gesperrt ist auch das Löschen von Tabellenzeilen, nicht nur von ganzen Tabellen. Die Telemetrie von
+n8n-mcp ist abgeschaltet (`N8N_MCP_TELEMETRY_DISABLED=true`, auch als Standardwert im Image), es gehen also keine
+Nutzungsdaten und keine Inhalte von Workflows an den Hersteller. Vor dem Start wechselt der Befehl in den Ordner
+`/opt/buildbar`: n8n-mcp lädt sonst eine Datei `.env` aus dem Arbeitsordner des Assistenten. Von den Zugängen der
+Person bekommt n8n-mcp nur den n8n-Zugang, nicht das Zugangszeichen zum Veröffentlichen und nicht die Nutzer-ID.
+Vorsorglich nimmt der Befehl auch den Schlüssel des Terminals heraus (`OPEN_TERMINAL_API_KEY`), ebenso `app` für npm,
+Next.js und git. Was der Container sonst in seiner Umgebung hat, geht unverändert an diese Programme. Welche Namen
+das sind, zeigt im Terminal `env | cut -d= -f1` (nur die Namen, keine Werte).
 
 ## Bekannte Grenzen
 
@@ -123,7 +150,11 @@ Zugängen des Kontos, in dem sie liegen.
 
 ## Bauen und aktualisieren
 
-Jeder Push auf `main` baut das Image über GitHub Actions und schiebt es nach GHCR (`:buildbar` und `:buildbar-<sha>`).
+Jeder Push auf `main`, der das Image betrifft, baut es über GitHub Actions und schiebt es nach GHCR. Jede Fassung
+bekommt zwei Namen: `:buildbar` (immer die neueste) und `:buildbar-<sha>` (genau diese Fassung). Die Terminals holen
+eine neue Fassung, wenn die Verbindung auf `:buildbar` steht und das Image beim Start neu geprüft wird
+(`imagePullPolicy: Always`), oder wenn im Feld „Bild“ der Name der neuen Fassung eingetragen und „Terminals
+aktualisieren“ geklickt wird. Änderungen nur an dieser Beschreibung oder am Zusatz lösen keinen Bau aus.
 Lokal: `docker build -t one-compute-buildbar .` und `docker run --rm -it --entrypoint bash one-compute-buildbar`, dann
 `buildbar-status`. Versionen: n8n-mcp 2.91.0, puppeteer-core 23.11.1, Basis open-terminal 0.17.7 (im Dockerfile).
 Der Zusatz liegt unter `openwebui/` und wird in Open WebUI aktualisiert, nicht über das Image.

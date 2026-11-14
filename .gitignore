@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# Sicherungen früherer Stände (zum Beispiel bin/app.vor-v12) gehören nicht ins Repo
+*.vor-*

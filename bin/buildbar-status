@@ -21,7 +21,15 @@ hub_anfrage() {  # $1 Pfad, weitere Argumente gehen an curl
 
 # Einen n8n-Schlüssel in den Chat einfügen ist nur sicher, wenn der Zusatz „buildbar Zugang“ in one.intelligence aktiv
 # ist: Er fängt den Schlüssel ab, bevor das Modell ihn sieht, und schreibt beim Ablegen ZUSATZ=1 in die Zugangsdatei.
-# Das prüft unten der Abschnitt „ES FEHLT“.
+# ZUSATZ=1 bleibt aber in der Datei stehen, auch wenn der Zusatz später abgeschaltet wird. Solange er läuft, schreibt er
+# die Datei bei einer Nachricht neu, sobald sie älter als 10 Minuten ist. Der Zusatz gilt deshalb nur als aktiv, wenn
+# die Datei in den letzten 30 Minuten geschrieben wurde. Das nutzt unten der Abschnitt „ES FEHLT“.
+# Die 10 Minuten stehen im Zusatz (MERKER_DAUER = 600 Sekunden) und müssen unter den 30 Minuten hier bleiben. Sonst
+# gilt der Zusatz bei allen als nicht aktiv, und niemand bekommt mehr die Anleitung zum Einfügen.
+zusatz_aktiv=''
+if [ -n "${ZUSATZ:-}" ] && [ -n "$(find "$HOME/.buildbar/zugang.env" -mmin -30 2>/dev/null)" ]; then
+  zusatz_aktiv=1
+fi
 
 echo "buildbar-Arbeitsplatz"
 echo "Werkzeuge: node $(node --version 2>/dev/null || echo fehlt), n8n-mcp $(command -v n8n-mcp >/dev/null && echo da || echo fehlt), chromium $([ -x /usr/bin/chromium ] && echo da || echo fehlt), seite-pruefen $([ -f /opt/buildbar/seite-pruefen.js ] && echo da || echo fehlt)"
@@ -46,12 +54,15 @@ if [ -n "${N8N_API_KEY:-}" ]; then
          [ "$ucode" = "200" ] && echo "n8n: ACHTUNG, der Schlüssel gehört einem Admin-Konto und sieht alle Konten dieser n8n. Nur für Tests der Betreuung; du arbeitest trotzdem nur mit Workflows, die mit „buildbar: “ beginnen."
          ;;
     401|403) echo "n8n: Schlüssel wird abgelehnt (HTTP $code)."; fehlt+=("N8N_API_KEY") ;;
-    *) echo "n8n: nicht erreichbar (HTTP $code)" ;;
+    # Zeitüberschreitung (000), 5xx, 404, Umleitung: eine Störung, dann darf unten nicht „ALLES BEREIT.“ stehen
+    *) echo "n8n: nicht erreichbar (HTTP $code)"; fehlt+=("STOERUNG") ;;
   esac
 else
   echo "n8n: Schlüssel fehlt"
-  # Fehlt die ganze Zugangsdatei, kommt zuerst die Bitte, die Nachricht noch einmal zu schicken
-  [ -f "$HOME/.buildbar/zugang.env" ] && fehlt+=("N8N_API_KEY")
+  # Fehlt die ganze Zugangsdatei (Eintrag DATEI), kommt zuerst nur die Bitte, die Nachricht noch einmal zu schicken.
+  # Sonst gehört der fehlende Schlüssel immer unter „ES FEHLT“, auch bei der alten Einrichtung nur mit geheim.env:
+  # Ohne den Eintrag stünde unten „ALLES BEREIT.“, obwohl der Schlüssel fehlt.
+  [[ " ${fehlt[*]} " != *" DATEI "* ]] && fehlt+=("N8N_API_KEY")
 fi
 
 # Zugänge im n8n-Konto: Ein n8n-Schlüssel kann sie nicht auflisten (kein Recht dafür). buildbar-merken merkt sich die,
@@ -65,12 +76,14 @@ if [ -n "${OIL_HUB_TOKEN:-}" ]; then
   code=$(hub_anfrage "/person" -o /dev/null -w '%{http_code}')
   case "$code" in
     200) echo "Veröffentlichen: verbunden ($HUB)" ;;
-    401|403) echo "Veröffentlichen: Zugang wird abgelehnt (HTTP $code)."; fehlt+=("ZUSATZ") ;;
-    *) echo "Veröffentlichen: Dienst nicht erreichbar (HTTP $code)" ;;
+    # Der Dienst lehnt das Zugangszeichen ab: Das liegt an der Einrichtung (Kurs-Geheimnis, Kürzel), nicht am Zusatz
+    401|403) echo "Veröffentlichen: Zugang wird abgelehnt (HTTP $code)."; fehlt+=("HUB") ;;
+    *) echo "Veröffentlichen: Dienst nicht erreichbar (HTTP $code)"; fehlt+=("STOERUNG") ;;
   esac
 elif [[ " ${fehlt[*]} " != *" DATEI "* ]]; then
   echo "Veröffentlichen: Zugang fehlt"
-  fehlt+=("ZUSATZ")
+  # Läuft der Zusatz und das Zugangszeichen fehlt trotzdem, stimmt seine Einrichtung nicht (Kurs-Geheimnis leer)
+  if [ -n "$zusatz_aktiv" ]; then fehlt+=("HUB"); else fehlt+=("ZUSATZ"); fi
 fi
 
 if [ ${#fehlt[@]} -gt 0 ]; then
@@ -79,12 +92,14 @@ if [ ${#fehlt[@]} -gt 0 ]; then
   printf '%s\n' "${fehlt[@]}" | sort -u | while read -r k; do
     case "$k" in
       DATEI) echo "  Die Zugangsdatei ist noch nicht da. Das passiert, wenn das Terminal gerade erst gestartet ist: Bitte die Person, ihre Nachricht einfach noch einmal zu schicken. Kommt das beim zweiten Mal wieder: Der Zusatz „buildbar Zugang“ ist nicht aktiv, Betreuung fragen." ;;
+      HUB) echo "  Der Zugang zum Veröffentlichen passt nicht. Das liegt nicht an dir. Bitte die Betreuung fragen." ;;
       N8N_API_KEY)
-        if [ -n "${ZUSATZ:-}" ]; then
-          echo "  n8n-Schlüssel: Die Person öffnet n8n ($N8N), klickt unten links auf ihren Namen, dann „Settings“ (Einstellungen), „n8n API“ und „Create an API key“ (Schlüssel erstellen, alle Rechte anhaken), kopiert den Schlüssel und fügt ihn hier in den Chat ein. Der Zusatz „buildbar Zugang“ fängt ihn ab und speichert ihn, du bekommst ihn nicht zu sehen. Danach buildbar-status erneut aufrufen."
+        if [ -n "$zusatz_aktiv" ]; then
+          echo "  n8n-Schlüssel: Die Person öffnet diese Seite: $N8N/settings/api (als anklickbaren Link weitergeben; von Hand: in n8n unten links auf den eigenen Namen, dann „Settings“ (Einstellungen), „n8n API“). Dort „Create an API key“ (Schlüssel erstellen): einen Namen eintragen, bei „Expiration“ (Gültigkeit) die längste Dauer wählen, am besten „No Expiration“, sonst läuft der Schlüssel nach 30 Tagen ab, und alle Rechte anhaken, falls danach gefragt wird. Den Schlüssel kopieren (er wird nur einmal angezeigt) und hier in den Chat einfügen. Der Zusatz „buildbar Zugang“ fängt ihn ab und speichert ihn, du bekommst ihn nicht zu sehen. Danach buildbar-status erneut aufrufen."
         else
           echo "  n8n-Schlüssel: Bitte die Betreuung fragen. Die Person fügt keinen Schlüssel in den Chat ein, solange der Zusatz „buildbar Zugang“ nicht aktiv ist."
         fi ;;
+      STOERUNG) echo "  Ein Dienst antwortet gerade nicht (siehe oben). Das liegt nicht an der Person. In ein paar Minuten buildbar-status erneut aufrufen; bleibt es so, Betreuung fragen." ;;
       ZUSATZ) echo "  Kürzel und Zugang zum Veröffentlichen fehlen: Der Zusatz „buildbar Zugang“ ist in one.intelligence nicht aktiv. Bitte die Betreuung fragen." ;;
     esac
   done

@@ -1,4 +1,38 @@
 #!/usr/bin/env bash
 # seite-pruefen: Oberfläche einer App im Browser prüfen (Bild am Rechner und auf dem Handy, Überbreite,
 # Kontrast, Fehler). Hilfe: seite-pruefen hilfe
-SEITE_PRUEFEN_MODUL=/opt/buildbar/node_modules/puppeteer-core exec node /opt/buildbar/seite-pruefen.js "$@"
+#
+# Sperre: Chromium läuft nie neben einem Bau, denn das Terminal hat nur 2 GB Arbeitsspeicher. Vor dem Start nimmt der
+# Befehl deshalb /tmp/buildbar-bau.lock, dieselbe Sperre wie beim Bau (flock). Ist sie belegt, prüft er zuerst ohne
+# Browser Adresse, Schritte und Dateien: Eine Ablehnung kommt so sofort und nicht erst nach dem Warten. Danach wartet
+# er höchstens 15 Minuten.
+# BUILDBAR_SPERRE_GEHALTEN=1 heißt: Der Aufrufer (app) hält die Sperre schon. Ohne das Programm flock läuft der Befehl
+# ohne Sperre. Gehalten wird sie, solange node läuft (node erbt die offene Sperrdatei, fd 9). Chromium erbt sie nicht,
+# endet aber mit node: puppeteer spricht über eine Leitung mit ihm, und reißt die ab, beendet sich Chromium selbst.
+SPERRE=/tmp/buildbar-bau.lock
+JS=/opt/buildbar/seite-pruefen.js
+
+case "${1:-}" in
+  [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) mit_sperre=1 ;;
+  *) mit_sperre=0 ;; # Hilfe und falsche Aufrufe starten keinen Browser und warten nicht
+esac
+
+if [ "$mit_sperre" = 1 ] && [ "${BUILDBAR_SPERRE_GEHALTEN:-}" != 1 ] && command -v flock >/dev/null 2>&1; then
+  [ -e "$SPERRE" ] || : >>"$SPERRE" 2>/dev/null
+  # Nur eine normale Datei, keine Verknüpfung. Nur lesend öffnen, wie app: flock braucht kein Schreibrecht, und eine
+  # Sperrdatei, die einem anderen Nutzer gehört, bleibt nutzbar.
+  if [ -f "$SPERRE" ] && [ ! -L "$SPERRE" ] && { exec 9<"$SPERRE"; } 2>/dev/null; then
+    if ! flock -n 9; then
+      node "$JS" --nur-vorab "$@" 9<&- || exit $?
+      echo "Warte, bis der laufende Bau oder die andere Prüfung fertig ist (höchstens 15 Minuten) …"
+      if ! flock -w 900 9; then
+        echo "FEHLER: seite-pruefen hat 15 Minuten gewartet, weil gerade ein Bau oder eine andere Prüfung läuft, und startet deshalb nicht."
+        exit 1
+      fi
+    fi
+  else
+    echo "Hinweis: Die Sperre $SPERRE ließ sich nicht öffnen, seite-pruefen läuft ohne Sperre."
+  fi
+fi
+
+SEITE_PRUEFEN_MODUL=/opt/buildbar/node_modules/puppeteer-core exec node "$JS" "$@"
