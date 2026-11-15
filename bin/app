@@ -15,6 +15,7 @@
 Statt einer eigenen Vorschau (npm run dev, npm start) immer „app ansehen“. Es läuft immer nur ein Bau zur selben
 Zeit, ein zweiter wartet bis zu 15 Minuten. --ohne-vorpruefung nur, wenn die Vorprüfung selbst nicht geht.
 """
+import datetime
 import glob
 import json
 import os
@@ -286,13 +287,27 @@ def liste():
         print(f'{a["name"]:24} {a["adresse"]}  Laufzeit: {a.get("laufzeit")}  letzter Build: {lb.get("status", "-")}')
 
 
+def ortszeit(angabe):
+    """Eine Zeitangabe des Bereitstellungsdienstes (UTC, zum Beispiel 2026-11-14T23:11:23.000000Z) in der Zeit des
+    Arbeitsplatzes, so wie „date“ sie zeigt (TZ im Image: Europe/Berlin), mit dem Kürzel der Zeitzone. Sonst läse sich
+    der letzte Build eine oder zwei Stunden älter, als er ist. Was sich nicht lesen lässt, bleibt, wie es ist."""
+    try:
+        t = datetime.datetime.fromisoformat(str(angabe).strip().replace('Z', '+00:00'))
+    except ValueError:
+        return angabe
+    if t.tzinfo is None:
+        return angabe
+    return t.astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')
+
+
 def status(name=None):
     o = ordner_von(name) if not name else os.path.join(APPS, name)
     s, b = hub('GET', '/apps/' + os.path.basename(o))
     if s != 200:
         raus(b.get('fehler', f'HTTP {s}'))
     lb = b.get('letzter_build') or {}
-    print(f'{b["name"]}: {b["adresse"]}\nLaufzeit: {b.get("laufzeit")}\nLetzter Build: {lb.get("status", "-")} ({lb.get("beginn", "")} bis {lb.get("ende", "")})')
+    print(f'{b["name"]}: {b["adresse"]}\nLaufzeit: {b.get("laufzeit")}\nLetzter Build: {lb.get("status", "-")} '
+          f'({ortszeit(lb.get("beginn", ""))} bis {ortszeit(lb.get("ende", ""))})')
 
 
 def hat_workflow(o):
@@ -324,7 +339,8 @@ def offen_vor_abschluss(o):
 
 
 def erinnerung(o):
-    """Der Hinweis am Ende von „app veroeffentlichen“, solange vor dem Abschluss noch etwas fehlt (sonst leer)."""
+    """Der Hinweis gegen Ende von „app veroeffentlichen“, solange vor dem Abschluss noch etwas fehlt (sonst leer).
+    Nach ihm kommt nur noch die Erinnerung an die Adresse (ZUERST_SAGEN)."""
     fehlt = offen_vor_abschluss(o)
     if not fehlt:
         return ''
@@ -338,9 +354,15 @@ def erinnerung(o):
 
 # Die Adresse der fertigen App stand in zwei Probeläufen nur im Denken des Modells und kam erst nach 5 bis 12 Minuten in den
 # Chat (Labor, 14.11.2026). Deshalb sagt der Befehl selbst, was jetzt als sichtbare Zeile in den Chat gehört.
-ZUERST_SAGEN = ('JETZT ZUERST, falls in diesem Chat noch nicht geschehen: Schreib als sichtbare Zeile im Chat (nicht nur '
-                'denken), noch vor dem nächsten Werkzeugaufruf: „Deine Anwendung ist online: [{a}]({a}). Probier sie gleich '
-                'aus. Ich prüfe sie währenddessen weiter, das Ergebnis steht in etwa einer Viertelstunde hier darunter.“')
+# Im dritten Probelauf stand die Erinnerung vor dem Hinweis auf die Pflichtschritte und wirkte wieder nicht. Seitdem ist
+# sie die allerletzte Zeile der ganzen Ausgabe von „app veroeffentlichen“: Nach ihr gibt der Befehl nichts mehr aus.
+# Ursache (Analyse vom 15.11.2026): Claude Opus 5.5 liefert Text zwischen zwei Werkzeugaufrufen nur dann als Text aus,
+# wenn er kurz ist, sonst als Denken. Gemessen im Labor: bis 160 Zeichen 19 von 20 sichtbar, ab 194 Zeichen 1 von 17.
+# Der alte Satz hatte 267 Zeichen. Deshalb gibt der Befehl eine kurze Zeile vor (rund 90 Zeichen, 5 von 5 sichtbar).
+# Die Zeile beginnt mit „LIVE“, weil das Modell die Ausgabe oft mit grep LIVE oder tail filtert, und bleibt eine Zeile.
+ZUERST_SAGEN = ('LIVE. JETZT SAGEN, falls seit dem ersten LIVE noch nicht als Antworttext geschehen: Schreib vor dem '
+                'nächsten Befehl genau diese eine kurze Zeile und keinen Satz dazu, denn mitten in der Arbeit kommt nur '
+                'ein kurzer Satz im Chat an: [Deine Anwendung ist jetzt online]({a})')
 
 
 # --- Bausperre, Prozessgruppen, Ansicht der gebauten App ---------------------------------------------------------------
@@ -850,7 +872,8 @@ def vorpruefung(o):
     wird. Harte Befunde halten das Veröffentlichen an: Die Startseite antwortet nicht mit 200 (auch: sie leitet
     woandershin weiter), oder die Seite wirft beim Laden einen Fehler im Browser (ein Eintrag „Skriptfehler: …“ unter
     „Fehler im Browser“ im Bericht von seite-pruefen, siehe fehler_im_browser). Befunde zur Darstellung (zu breit,
-    Kontrast, Tabellenspalten) und Meldungen der Konsole sind Hinweise. Geht die Prüfung selbst nicht (kein Browser,
+    sehr kleine Schrift, Kontrast, Tabellenspalten) und Meldungen der Konsole sind Hinweise: Ihre Zeilen stehen im
+    gekürzten Bericht (bericht_kurz), halten aber nichts an. Geht die Prüfung selbst nicht (kein Browser,
     Zeitüberschreitung, Abbruch zum Schutz vor internen Adressen), ist das ebenfalls ein Hinweis, kein Abbruch."""
     e = ansicht(o, kurzname=os.path.basename(o) + '-vorpruefung',
                 bereit=lambda status, weiter=None: print('    ' + startseite(status, weiter), flush=True))
@@ -953,8 +976,9 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung', schritte=None, vorpr
             echte_seite_pruefen(adresse, schritte)
             hinweis = erinnerung(o)
             if hinweis:
-                print(ZUERST_SAGEN.format(a=adresse))
                 print(hinweis)
+                # Zuletzt, als allerletzte Zeile der ganzen Ausgabe: Danach folgt nur noch return, auch im Aufrufer.
+                print(ZUERST_SAGEN.format(a=adresse), flush=True)
             return
         if i == 23 and not angestossen:
             s, _ = hub('POST', f'/apps/{os.path.basename(o)}/deploy')

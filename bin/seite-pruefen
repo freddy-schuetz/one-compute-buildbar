@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # seite-pruefen: Oberfläche einer App im Browser prüfen (Bild am Rechner und auf dem Handy, Überbreite,
-# Kontrast, Fehler). Hilfe: seite-pruefen hilfe
+# sehr kleine Schrift, Kontrast, Fehler). Hilfe: seite-pruefen hilfe (nennt am Ende die Fassung)
 #
 # Sperre: Chromium läuft nie neben einem Bau, denn das Terminal hat nur 2 GB Arbeitsspeicher. Vor dem Start nimmt der
 # Befehl deshalb /tmp/buildbar-bau.lock, dieselbe Sperre wie beim Bau (flock). Ist sie belegt, prüft er zuerst ohne

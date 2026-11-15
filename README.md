@@ -117,12 +117,15 @@ Webseite lesen). Alle Bausteine sind ein Angebot, keine Pflicht, und für jeden 
 | `/usr/local/bin/n8n-werkzeug` | ruft die n8n-mcp-Werkzeuge im n8n-Konto der Person auf |
 | `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge, Instanz-Audit, Agenten und Evaluations), ohne Telemetrie |
 | `/usr/local/bin/app` | App anlegen, auflisten, ansehen und veröffentlichen (über den Bereitstellungsdienst). `app ansehen` baut die App im Arbeitsplatz, startet sie nur lokal und prüft sie im Browser, ohne etwas zu veröffentlichen. `app veroeffentlichen` prüft vorher lokal und danach die echte Adresse. Es läuft immer nur ein Bau (Sperre `/tmp/buildbar-bau.lock`, der Arbeitsplatz hat 2 GB) |
-| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy (am Handy wie ein echtes Gerät neu geladen), Überbreite, Kontrast, Fehler. Schritt `datei` lädt eine Datei aus dem Ordner der App oder aus `/tmp` in ein Dateifeld. Nur eigene Apps und, mit `SEITE_PRUEFEN_LOKAL=1`, die lokal gestartete App; interne Adressen sind gesperrt |
+| `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy (am Handy wie ein echtes Gerät neu geladen), Überbreite, sehr kleine Schrift (am Bildschirm unter 11 px, auch die Beschriftung einer verkleinert gezeigten Zeichnung), Kontrast, Fehler. Schritt `datei` lädt eine Datei aus dem Ordner der App oder aus `/tmp` in ein Dateifeld. Nur eigene Apps und, mit `SEITE_PRUEFEN_LOKAL=1`, die lokal gestartete App; interne Adressen sind gesperrt |
 | `/usr/local/bin/workflow-pruefen` | prüft einen n8n-Workflow auf stille Fehler (Name, Ausdruck ohne „=“, Webhook und Antwort, offene Weiterleitung, Kosten ohne Tageszähler, Code, KI, Zugänge) |
 | `/usr/local/bin/datei-ansehen` | liest eine angehängte Tabelle ganz (Spalten, Summen, Kontrollzeilen) und blendet Personendaten aus, bevor geplant wird |
 | `/usr/local/bin/seite-ansehen` | sieht eine fremde öffentliche Webseite einmal im Browser an: Bild, Hausfarben mit Kontrast, Logo-Kandidaten, Navigation, Text |
 | `/opt/buildbar/` | `seite-pruefen.js`, `seite-ansehen.js`, `puppeteer-core`, `schluessel-laden.sh` |
 | aus dem Basis-Image | Node 22, Python 3.12, Git, Chromium, curl, sudo |
+
+Die Zeitzone im Arbeitsplatz ist Europe/Berlin (`TZ` im Dockerfile): `date`, Python, Node und der Browser von
+`seite-pruefen` zeigen deutsche Zeit, mit Sommerzeit. `app status` rechnet die Zeiten des letzten Builds dorthin um.
 
 Zu `n8n-mcp-start`: Gesperrt ist auch das Löschen von Tabellenzeilen, nicht nur von ganzen Tabellen. Die Telemetrie von
 n8n-mcp ist abgeschaltet (`N8N_MCP_TELEMETRY_DISABLED=true`, auch als Standardwert im Image), es gehen also keine
@@ -156,5 +159,6 @@ eine neue Fassung, wenn die Verbindung auf `:buildbar` steht und das Image beim 
 (`imagePullPolicy: Always`), oder wenn im Feld „Bild“ der Name der neuen Fassung eingetragen und „Terminals
 aktualisieren“ geklickt wird. Änderungen nur an dieser Beschreibung oder am Zusatz lösen keinen Bau aus.
 Lokal: `docker build -t one-compute-buildbar .` und `docker run --rm -it --entrypoint bash one-compute-buildbar`, dann
-`buildbar-status`. Versionen: n8n-mcp 2.91.0, puppeteer-core 23.11.1, Basis open-terminal 0.17.7 (im Dockerfile).
+`buildbar-status`. Versionen: n8n-mcp 2.91.0, puppeteer-core 23.11.1, Basis open-terminal 0.17.7 (im Dockerfile),
+seite-pruefen 1.4 (`seite-pruefen hilfe` nennt die Fassung in der letzten Zeile).
 Der Zusatz liegt unter `openwebui/` und wird in Open WebUI aktualisiert, nicht über das Image.

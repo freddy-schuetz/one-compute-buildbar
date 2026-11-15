@@ -15,11 +15,16 @@ USER root
 # Standardwerte für alle Personen (ohne Geheimnisse); ~/.buildbar/zugang.env kann die beiden Adressen überschreiben.
 # N8N_MCP_TELEMETRY_DISABLED: n8n-mcp schickt keine Nutzungsdaten an seinen Hersteller. n8n-mcp-start setzt den Schalter
 # ebenfalls; hier gilt er auch, wenn jemand n8n-mcp direkt aufruft.
+# TZ: deutsche Zeit statt UTC. So zeigen „date“, Python, Node und der Browser von seite-pruefen dieselbe Uhrzeit wie bei
+# der Person vor dem Bildschirm (mit UTC gingen sie eine oder zwei Stunden nach, und kurz nach Mitternacht stünde noch
+# das Datum des Vortags in Bericht und Bildern). Die Zeitzonendaten liegen im Basis-Image; fehlten sie, gälte still
+# wieder UTC, deshalb prüft der Bau sie unten.
 ENV N8N_API_URL=https://n8n.oi.destination.one \
     OIL_HUB_URL=https://oi-labor-hub.friedemann-schuetz.eu \
     NPM_CONFIG_CACHE=/var/tmp/buildbar/npm-cache \
     BB_WERK=/var/tmp/buildbar \
-    N8N_MCP_TELEMETRY_DISABLED=true
+    N8N_MCP_TELEMETRY_DISABLED=true \
+    TZ=Europe/Berlin
 
 # n8n-mcp (Werkzeuge für n8n, fest auf die geprüfte Version) und der Browser-Baustein für seite-pruefen
 RUN npm install -g --no-audit --no-fund n8n-mcp@2.91.0 \
@@ -38,6 +43,7 @@ RUN chmod 755 /usr/local/bin/app /usr/local/bin/n8n-werkzeug /usr/local/bin/n8n-
  && python3 /usr/local/bin/datei-ansehen hilfe >/dev/null \
  && node -e "require('/opt/buildbar/node_modules/puppeteer-core/package.json')" \
  && command -v n8n-mcp >/dev/null \
+ && test -s /usr/share/zoneinfo/Europe/Berlin && test "$(date +%z)" != "+0000" \
  && rm -rf /usr/local/bin/__pycache__
 
 USER user
