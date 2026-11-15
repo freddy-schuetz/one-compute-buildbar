@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""app: eigene Apps anlegen, ansehen und veröffentlichen (buildbar auf one.intelligence).
+"""app: eigene Apps anlegen, ansehen, sichern und veröffentlichen (buildbar auf one.intelligence).
 
   app neu <name> ["Titel"]          neue App mit eigener Adresse, Ordner ~/apps/<name>
   app liste                         alle eigenen Apps mit Adresse und Stand
@@ -11,6 +11,12 @@
                                     bauen, die Seite vorher hier prüfen (harte Fehler halten an), nach Gitea
                                     übertragen, warten bis die neue Fassung live ist, dann die echte Adresse prüfen
                                     (mit den Schritten, wenn angegeben)
+  app sichern [<name>] ["Nachricht"]
+                                    nur Bericht, Stand, Notizen und Workflow-Dateien (pruefbericht.md, stand.md,
+                                    mein-use-case.md, README.md, workflows/*.json) nach Gitea übertragen und sofort
+                                    zurückkehren: ohne Bau, ohne Prüfung, ohne Warten. Die Antwort ist eine Zeile, die
+                                    mit „GESICHERT“ beginnt. Hat sich sonst etwas geändert, überträgt es nichts
+                                    („NICHT GESICHERT“), dann „app veroeffentlichen“ nehmen.
 
 Statt einer eigenen Vorschau (npm run dev, npm start) immer „app ansehen“. Es läuft immer nur ein Bau zur selben
 Zeit, ein zweiter wartet bis zu 15 Minuten. --ohne-vorpruefung nur, wenn die Vorprüfung selbst nicht geht.
@@ -97,19 +103,21 @@ def raus(text, code=1):
     sys.exit(code)
 
 
-def ordner_von(name=None):
+def ordner_von(name=None, vorsatz=''):
+    """Der Ordner der App: ~/apps/<name> oder der Ordner der App, in dem man gerade steht. vorsatz steht vor jeder
+    Meldung, mit der „app“ hier abbricht („app sichern“: „NICHT GESICHERT: “)."""
     if name:
         o = os.path.join(APPS, name)
         if not os.path.isdir(o):
-            raus(f'Den Ordner {o} gibt es nicht. „app liste“ zeigt deine Apps.')
+            raus(f'{vorsatz}Den Ordner {o} gibt es nicht. „app liste“ zeigt deine Apps.')
         return o
     pfad = os.path.abspath(os.getcwd())
     while pfad != os.path.dirname(pfad):
         if os.path.dirname(pfad) == APPS:
             return pfad
         pfad = os.path.dirname(pfad)
-    raus('Ich weiß nicht, welche App gemeint ist. Gib den Namen mit (zum Beispiel „app veroeffentlichen <name>“ oder '
-         '„app ansehen <name>“) oder ruf den Befehl im Ordner der App auf (~/apps/<name>).')
+    raus(vorsatz + 'Ich weiß nicht, welche App gemeint ist. Gib den Namen mit (zum Beispiel „app veroeffentlichen '
+         '<name>“ oder „app ansehen <name>“) oder ruf den Befehl im Ordner der App auf (~/apps/<name>).')
 
 
 def meta(ordner):
@@ -155,13 +163,33 @@ def platz_schaffen(behalten):
                 print(f'Platz geschaffen: {d}/{teil} entfernt (entsteht bei Bedarf neu).', flush=True)
 
 
-OI_N8N = 'https://n8n.oi.destination.one'
+OI_N8N = 'https://n8n.oi.destination.one'  # Standard, wenn N8N_API_URL fehlt oder keine brauchbare Adresse ist
+
+
+def n8n_adresse():
+    """Die n8n, die eine neue App aufruft: Schema und Host aus N8N_API_URL, also aus ~/.buildbar/zugang.env (Zusatz,
+    Einstellung n8n_url) oder aus dem Image (Dockerfile). Das liest _umgebung_laden() schon beim Start von „app“.
+    Ohne Pfad (etwa /api/v1) und ohne Zugangsdaten, einen Port nur, wenn er vom Standard abweicht. Fehlt die Angabe
+    oder ist sie keine http(s)-Adresse mit gewöhnlichem Hostnamen, gilt OI_N8N. So kommt nie etwas anderes als eine
+    saubere Adresse in den Code der App. Auf one.intelligence steht in N8N_API_URL OI_N8N selbst, im Labor dessen n8n
+    (früher stand hier fest OI_N8N, die erste Fassung im Labor rief deshalb die falsche n8n auf)."""
+    try:
+        teile = urllib.parse.urlsplit(os.environ.get('N8N_API_URL', '').strip())
+        host, port = teile.hostname or '', teile.port
+    except ValueError:  # etwa ein Port, der keine Zahl ist
+        return OI_N8N
+    if teile.scheme not in ('http', 'https') or not re.fullmatch(r'[a-z0-9]([a-z0-9._-]*[a-z0-9])?', host):
+        return OI_N8N
+    if not port or port == {'http': 80, 'https': 443}[teile.scheme]:
+        return f'{teile.scheme}://{host}'
+    return f'{teile.scheme}://{host}:{port}'
 
 
 def vorlage_fuer_oi(ziel):
-    """Die App-Vorlage kommt aus dem OI-Labor: Standard-n8n und Fußzeile auf one.intelligence umstellen.
-    Der Hub setzt beim Bauen keine n8n-Adresse, deshalb zählt der Standard in lib/n8n.ts."""
-    tausch = [('https://oi-labor-n8n.friedemann-schuetz.eu', OI_N8N), ('Gebaut im OI-Labor', 'Gebaut mit buildbar_')]
+    """Die App-Vorlage kommt aus dem OI-Labor: Standard-n8n auf die n8n der Person (n8n_adresse) und die Fußzeile auf
+    buildbar_ umstellen. Der Hub setzt beim Bauen keine n8n-Adresse, deshalb zählt der Standard in lib/n8n.ts."""
+    n8n = n8n_adresse()
+    tausch = [('https://oi-labor-n8n.friedemann-schuetz.eu', n8n), ('Gebaut im OI-Labor', 'Gebaut mit buildbar_')]
     for rel in ('lib/n8n.ts', 'README.md', '.env.local.example', 'components/Fuss.tsx'):
         p = os.path.join(ziel, rel)
         if not os.path.exists(p):
@@ -175,6 +203,11 @@ def vorlage_fuer_oi(ziel):
 
 
 GIT_INTERN = 'http://oil-gitea:3000/'
+
+
+def ohne_zugangsdaten(text):
+    """Meldungen von git ohne Zugangsdaten: https://name:token@host wird zu https://host."""
+    return re.sub(r'//[^@/]+@', '//', text)
 
 
 def person_meldung(s, b):
@@ -263,7 +296,7 @@ def neu(name, titel=''):
             rat = (f'Bitte gleich noch einmal versuchen: „app neu {b["name"]}“ holt den Ordner nach. '
                    'Klappt es wieder nicht, die Betreuung fragen.')
         raus(('Die App gibt es schon' if schon_da else 'App angelegt') + ', aber das Holen ging nicht: '
-             + re.sub(r'//[^@/]+@', '//', r.stderr)[-300:].rstrip() + '\n' + rat)
+             + ohne_zugangsdaten(r.stderr)[-300:].rstrip() + '\n' + rat)
     with open(os.path.join(ziel, '.oil-app.json'), 'w') as f:
         json.dump({'name': b['name'], 'adresse': b['adresse']}, f)
     vorlage_fuer_oi(ziel)
@@ -961,7 +994,7 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung', schritte=None, vorpr
     print('3/6 Übertrage den Stand nach Gitea ...', flush=True)
     r = lauf(['git', 'push', '-q', 'origin', 'HEAD:main'], o)
     if r.returncode != 0:
-        raus('PUSH FEHLGESCHLAGEN: ' + re.sub(r'//[^@/]+@', '//', r.stderr)[-400:])
+        raus('PUSH FEHLGESCHLAGEN: ' + ohne_zugangsdaten(r.stderr)[-400:])
     print('4/6 Coolify baut die App neu (meist 2 bis 5 Minuten) ...', flush=True)
     angestossen = False
     for i in range(72):
@@ -985,6 +1018,131 @@ def veroeffentlichen(name=None, nachricht='Aktualisierung', schritte=None, vorpr
             angestossen = s == 200
             print('    Noch nicht live, ich stoße den Build zusätzlich von Hand an ...', flush=True)
     raus(f'Nach 12 Minuten noch nicht live. „app status“ zeigt den Stand des Builds. Adresse: {adresse}', 2)
+
+
+# --- app sichern -------------------------------------------------------------------------------------------------------
+# In Bau 9 (Labor, 15.11.2026) änderten drei Veröffentlichungen an der Seite nichts (nur pruefbericht.md, stand.md und
+# mein-use-case.md), warteten aber je rund 2,5 Minuten auf die Auslieferung, ohne einen Satz für die Person. „app
+# sichern“ überträgt solche Stände und kehrt sofort zurück. Alles andere kann die Seite ändern und geht nur mit
+# „app veroeffentlichen“ hinaus (Bau, Vorprüfung, Warten auf die Auslieferung, Prüfung der echten Seite).
+NUR_SICHERN = ('pruefbericht.md', 'stand.md', 'mein-use-case.md', 'README.md')  # dazu workflows/*.json
+NICHT_GESICHERT = 'NICHT GESICHERT: '  # so beginnt bei „app sichern“ jede Meldung, nach der nichts übertragen ist
+
+
+def nur_zu_sichern(pfad):
+    """Darf diese Datei mit „app sichern“ hinaus, ohne dass die Seite neu geprüft wird? pfad ist der Pfad im Ordner der
+    App, wie git ihn nennt (mit /). Ja nur für NUR_SICHERN direkt im Ordner der App und für Dateien mit der Endung
+    .json direkt in workflows/. Groß- und Kleinschreibung zählt."""
+    return pfad in NUR_SICHERN or re.fullmatch(r'workflows/[^/]+\.json', pfad) is not None
+
+
+def _git(o, *argumente, index=None):
+    """git im Ordner o, ohne Geheimnisse in der Umgebung (wie lauf) und ohne Eingabe. index: eigene Indexdatei
+    (GIT_INDEX_FILE) statt des Index der App. Rückgabe: (Rückgabewert, Ausgabe, Fehlermeldung) als Text."""
+    env = _umgebung_ohne_geheimes()
+    env.pop('GIT_INDEX_FILE', None)
+    if index:
+        env['GIT_INDEX_FILE'] = index
+    try:
+        r = subprocess.run(['git', *argumente], cwd=o, env=env, stdin=subprocess.DEVNULL, capture_output=True)
+    except OSError as x:
+        return 127, '', f'git ließ sich nicht starten ({x.strerror or x})'
+    return r.returncode, r.stdout.decode('utf-8', 'replace'), r.stderr.decode('utf-8', 'replace')
+
+
+def _git_meldung(text):
+    """Eine Meldung von git für die eine Zeile von „app sichern“: ohne Zugangsdaten (wie bei „app veroeffentlichen“),
+    ohne die Ratschläge von git (Zeilen „hint: …“, sonst schieben sie den Grund aus den 400 Zeichen, etwa „[rejected]“
+    bei einem abgelehnten Push), Zeilenumbrüche als Leerzeichen, höchstens die letzten 400 Zeichen."""
+    zeilen = [z for z in ohne_zugangsdaten(text).splitlines() if not z.startswith('hint:')]
+    return ' '.join(' '.join(zeilen).split())[-400:] or 'keine'
+
+
+def _dateien(eintraege, hoechstens=5):
+    """Die Dateien aus eintraege (Art, Pfad) für die eine Zeile: höchstens fünf, nach Pfad sortiert, mit „(neu)“ oder
+    „(gelöscht)“ dahinter. Steuerzeichen und Zeilentrenner im Namen werden zu „?“: So beginnt kein Dateiname eine
+    eigene Zeile (etwa eine, die mit „GESICHERT“ anfängt)."""
+    zusatz = {'A': ' (neu)', 'D': ' (gelöscht)'}
+    namen = []
+    for art, pfad in sorted(eintraege, key=lambda e: e[1]):
+        name = re.sub(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]', '?', pfad)
+        namen.append((name if len(name) <= 80 else name[:79] + '…') + zusatz.get(art, ''))
+    rest = len(namen) - hoechstens
+    return ', '.join(namen[:hoechstens]) + (f' und {rest} weitere' if rest > 0 else '')
+
+
+def _aenderungen(o, basis, index=None):
+    """Was im Index (index: eigene Indexdatei, sonst der Index der App) anders ist als im Commit basis, als Liste aus
+    (Art, Pfad): A neu, D gelöscht, M geändert, T anders abgelegt (etwa Link statt Datei). Umbenennungen zählen als
+    gelöscht und neu (--no-renames), so prüft nur_zu_sichern den alten und den neuen Namen.
+    Rückgabe: (Liste, None) oder (None, Meldung von git)."""
+    rc, aus, fehler = _git(o, 'diff', '--cached', '--name-status', '-z', '--no-renames', '--no-color', '--no-ext-diff',
+                           basis, '--', index=index)
+    if rc != 0:
+        return None, fehler or f'git diff endete mit {rc}'
+    teile = aus.split('\0')
+    return [(teile[i][:1], teile[i + 1]) for i in range(0, len(teile) - 1, 2)], None
+
+
+def sichern(name=None, nachricht='Sicherung'):
+    """„app sichern“: Bericht, Stand, Notizen und Workflow-Dateien (NUR_SICHERN, workflows/*.json) nach Gitea
+    übertragen, ohne Bau, ohne Vorprüfung, ohne Warten auf die Auslieferung und ohne Prüfung der Seite.
+    Verglichen wird mit dem letzten Stand auf Gitea (origin/main, wie ihn das letzte Übertragen hinterlassen hat), nicht
+    nur mit dem letzten Commit: So geht auch ein Commit, der hier liegen blieb (etwa weil das Übertragen nicht ging),
+    nie ungeprüft mit hinaus. Geprüft wird an einer Kopie des Index, in die „git add -A“ alles aufnimmt, was auch
+    „app veroeffentlichen“ aufnähme: neue, geänderte, gelöschte und umbenannte Dateien. Der Commit entsteht aus genau
+    dieser Kopie; was sich währenddessen noch ändert, bleibt draußen. Weigert sich „app sichern“, bleibt alles, wie es
+    war, auch der Index der App.
+    Die Ausgabe ist immer genau eine Zeile: „GESICHERT …“ mit Rückgabewert 0 oder „NICHT GESICHERT: …“ mit 1.
+    Zugang und Übertragen wie bei „app veroeffentlichen“ (git_zugang, git push origin HEAD:main, Meldungen ohne
+    Zugangsdaten), aber ohne public/version.txt. Ohne Bausperre: Es wird nichts gebaut, und auch „app veroeffentlichen“
+    hält sie beim Übertragen nicht."""
+    if not TOKEN:
+        raus(NICHT_GESICHERT + 'Der Zugang zum Veröffentlichen fehlt. „buildbar-status“ zeigt, was zu tun ist.')
+    o = ordner_von(name, NICHT_GESICHERT)
+    rc, oben, _ = _git(o, 'rev-parse', '--show-toplevel')
+    if rc != 0 or os.path.realpath(oben.rstrip('\n')) != os.path.realpath(o):
+        raus(NICHT_GESICHERT + f'Im Ordner {o} kennt git keinen Stand der App. Bitte die Betreuung fragen.')
+    rc, basis, _ = _git(o, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main^{commit}')
+    basis = basis.strip()
+    if rc != 0 or not basis:
+        raus(NICHT_GESICHERT + 'Den letzten Stand auf Gitea kenne ich hier nicht. Nimm „app veroeffentlichen“.')
+    hilfsordner = tempfile.mkdtemp(prefix='app-sichern-')
+    try:
+        index = os.path.join(hilfsordner, 'index')
+        rc, echt, _ = _git(o, 'rev-parse', '--git-path', 'index')
+        echt = os.path.join(o, echt.rstrip('\n'))
+        if rc == 0 and os.path.isfile(echt):
+            shutil.copyfile(echt, index)
+        rc, _, fehler = _git(o, 'add', '-A', index=index)
+        eintraege, fehler = _aenderungen(o, basis, index) if rc == 0 else (None, fehler)
+        if eintraege is None:
+            raus(NICHT_GESICHERT + 'Ich konnte nicht prüfen, was sich geändert hat. Meldung von git: '
+                 + _git_meldung(fehler))
+        if not eintraege:
+            print('GESICHERT: Es war nichts zu tun, seit dem letzten Veröffentlichen oder Sichern hat sich nichts '
+                  'geändert.')
+            return
+        seite = [e for e in eintraege if not nur_zu_sichern(e[1])]
+        if seite:
+            raus(NICHT_GESICHERT + 'Hier hat sich die Seite geändert: ' + _dateien(seite)
+                 + '. Nimm „app veroeffentlichen“.')
+        git_zugang()
+        # 0: Die Kopie entspricht dem letzten Commit, es liegen nur Commits bereit, die noch nicht auf Gitea sind.
+        rc, _, _ = _git(o, 'diff', '--cached', '--quiet', 'HEAD', '--', index=index)
+        if rc != 0:
+            rc, aus, fehler = _git(o, 'commit', '-q', '-m', nachricht, index=index)
+            if rc != 0:
+                raus(NICHT_GESICHERT + 'Der Commit ging nicht. Meldung von git: ' + _git_meldung(fehler or aus))
+            _git(o, 'reset', '-q')  # Index der App auf den neuen Commit; die Dateien selbst bleiben, wie sie sind
+    finally:
+        shutil.rmtree(hilfsordner, ignore_errors=True)
+    rc, _, fehler = _git(o, 'push', '-q', 'origin', 'HEAD:main')
+    if rc != 0:
+        raus(NICHT_GESICHERT + 'Die Übertragung nach Gitea ging nicht, der Stand liegt nur hier. Gleich noch einmal '
+             '„app sichern“ aufrufen; klappt es wieder nicht, die Betreuung fragen. Meldung von git: '
+             + _git_meldung(fehler))
+    print('GESICHERT und nach Gitea übertragen: ' + _dateien(eintraege) + '. An der Seite ändert sich nichts.')
 
 
 def optionen(argumente, mit_wert=(), schalter=()):
@@ -1047,6 +1205,22 @@ if __name__ == '__main__':
             raus('Zu viele Angaben. So geht es: app ansehen [<name>] [--schritte <datei.json>] [--name <kurzname>]')
         ansehen(rest[0] if rest else None, schritte_datei(opt['--schritte']) if '--schritte' in opt else None,
                 opt.get('--name'))
+        sys.exit(0)
+    if befehl == 'sichern':
+        # Vor der Prüfung des Zugangs unten: Bei „app sichern“ beginnt jede Meldung, nach der nichts übertragen ist, mit
+        # „NICHT GESICHERT“, auch die zum fehlenden Zugang (sichern prüft ihn selbst).
+        rest = a[1:]
+        fremd = next((x for x in rest if x.startswith('--') and ' ' not in x), None)
+        if fremd:
+            raus(f'{NICHT_GESICHERT}„{fremd}“ kenne ich bei „app sichern“ nicht. So geht es: app sichern "<was>"')
+        erstes, name = (rest[0] if rest else ''), None
+        if erstes not in ('', '.', '..') and '/' not in erstes and os.path.isdir(os.path.join(APPS, erstes)):
+            name, rest = erstes, rest[1:]
+        try:
+            sichern(name, ' '.join(rest).strip() or 'Sicherung')  # nur Leerzeichen: git lehnte die Nachricht ab
+        except Exception as x:  # etwa /tmp voll, Index nicht lesbar: auch dann genau eine Zeile, nichts übertragen
+            raus(NICHT_GESICHERT + 'Im Arbeitsplatz ging etwas nicht. Bitte die Betreuung fragen. Meldung: '
+                 + _git_meldung(f'{type(x).__name__}: {x}'))
         sys.exit(0)
     if not TOKEN:
         raus('Der Zugang zum Veröffentlichen fehlt. „buildbar-status“ zeigt, was zu tun ist.')

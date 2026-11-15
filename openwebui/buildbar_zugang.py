@@ -1,7 +1,7 @@
 """
 title: buildbar Zugang
 author: Friedemann Schütz
-version: 0.4.3
+version: 0.4.4
 required_open_webui_version: 0.12.0
 description: Legt n8n-Schlüssel, Kürzel und Zugang zum Veröffentlichen unsichtbar im Terminal der Person ab. Fängt einen in den Chat eingefügten n8n-Schlüssel ab, bevor das Modell ihn sieht, und ersetzt ihn auch im gespeicherten Verlauf.
 """
@@ -27,8 +27,12 @@ description: Legt n8n-Schlüssel, Kürzel und Zugang zum Veröffentlichen unsich
 # Seit 0.4.2 räumt der Filter außerdem auf, was in echten Läufen im Chat störte: den Platzhalter der Zwischenschicht
 # („[System: Empty message content sanitised …]“) und englische Arbeitsnotizen zwischen Werkzeugaufrufen. Der Platzhalter
 # entsteht, weil Open WebUI Werkzeugaufrufe mit leerem Text ('') weitergibt; der Filter schickt stattdessen keinen Text.
-# Seit 0.4.3 erinnert er das Modell nur noch dann an Deutsch, wenn es in der laufenden Werkzeugfolge wirklich eine
-# englische Notiz geschrieben hat (abschaltbar in den Einstellungen).
+# Seit 0.4.3 erinnert er das Modell nur dann an Deutsch, wenn es wirklich eine englische Notiz geschrieben hat, seit
+# 0.4.4 nur noch im Modellaufruf direkt danach und ohne etwas freizustellen (abschaltbar in den Einstellungen).
+# Seit 0.4.4 merkt er sich außerdem, wenn die Person in diesem Chat um Kürze gebeten hat („zu lang“, „kürzer“, Eile,
+# keine Zeit, Handy). Dann hängt er vor jedem Modellaufruf einen kurzen Hinweis ans Ende der Systemanweisung: Bis zum
+# Ende des Chats gilt die kurze Form (abschaltbar). Hinweis und Erinnerung stehen nur in der Anfrage an das Modell, nie im
+# gespeicherten Verlauf.
 #
 # Grenzen, die dieser Filter nicht schließen kann (für den Betrieb):
 # - Erste Nachricht eines neuen Chats: Open WebUI erzeugt den Chat-Titel aus dem Klartext, bevor ein Filter läuft. Steht
@@ -211,9 +215,11 @@ def tief_tauschen(wert, genau=()):
 #    an Stelle leerer Assistenten-Nachrichten ein, das Modell sieht ihn in seinem Verlauf und schreibt ihn nach.
 # 2. Englische Arbeitsnotizen zwischen zwei Werkzeugaufrufen („The pkill pattern matched its own shell …“).
 PLATZHALTER_PROXY = '[System: Empty message content sanitised to satisfy protocol]'
-ERINNERUNG = ('[Erinnerung aus deiner Anleitung, sie stammt nicht von der Person: Eine deiner Zwischennotizen war auf Englisch und '
-              'stand so im Chat der Person. Arbeite einfach weiter. Wenn du zwischen zwei Werkzeugaufrufen etwas schreibst, dann '
-              'höchstens einen kurzen deutschen Satz für die Person, nie Notizen an dich selbst. Erwähne diese Erinnerung nicht.]')
+# Seit 0.4.4 ohne „Arbeite einfach weiter“ und ohne „dann höchstens“: Dieser Wortlaut machte die Sätze, die die Skills
+# verlangen, zur Kann-Sache (Probe-Bau 9: zwei von drei bewährten Schlusssätzen fehlten, solange die Erinnerung hing).
+ERINNERUNG = ('[Erinnerung aus deiner Anleitung, sie stammt nicht von der Person: Eine deiner Zwischennotizen war auf Englisch. '
+              'Was du für {name} zwischen zwei Werkzeugaufrufen schreibst, ist ein kurzer deutscher Satz, Notizen an dich selbst '
+              'schreibst du nicht. Erwähne diese Erinnerung nicht.]')
 _EN = frozenset("the is are were i i'll i'm i've it it's its that this these those to of and on for with now then again need needs "
                 "checking let me but not from own up put came file files matched split first next should can have has had already "
                 "both into step steps there here which while when because instead we'll let's running run got get gets looks look "
@@ -374,27 +380,38 @@ async def _vorschlaege_gespeichert(chat_id: str, nachricht_id: str, ganz: bool =
     return bool(nachricht.get('followUps'))
 
 
-def englische_notiz_in_folge(nachrichten: list) -> bool:
-    """True, wenn der Assistent in der laufenden Werkzeugfolge (seit der letzten Nachricht der Person) eine englische
-    Arbeitsnotiz geschrieben hat."""
-    for n in reversed(nachrichten):
-        if not isinstance(n, dict):
-            continue
-        if n.get('role') == 'user':
-            return False
-        if n.get('role') == 'assistant' and any(enthaelt_englisch(t) for t in _texte(n)):
+def _bilder_der_werkzeuge(nachricht) -> bool:
+    """True für die Nachricht, die Open WebUI selbst aus Bildern in Werkzeugausgaben macht (Rolle user, kein Text der Person)."""
+    return (isinstance(nachricht, dict) and nachricht.get('role') == 'user'
+            and any(t.startswith(BILDER_VON_WERKZEUGEN) for t in _texte(nachricht)))
+
+
+def englische_notiz_davor(nachrichten: list) -> bool:
+    """True, wenn der Assistent im Modellaufruf direkt vor den Werkzeugergebnissen am Ende eine englische Arbeitsnotiz
+    geschrieben hat. Seit 0.4.4 zählt nur dieser eine Aufruf: Bis 0.4.3 galt die ganze Werkzeugfolge seit der letzten
+    Nachricht der Person, und im Probe-Bau 9 hing die Erinnerung nach einer einzigen Notiz an 20 Modellaufrufen."""
+    i = len(nachrichten) - 1
+    werkzeug = False
+    while i >= 0 and isinstance(nachrichten[i], dict) and (nachrichten[i].get('role') == 'tool' or _bilder_der_werkzeuge(nachrichten[i])):
+        werkzeug = werkzeug or nachrichten[i].get('role') == 'tool'
+        i -= 1
+    if not werkzeug:
+        return False
+    while i >= 0 and isinstance(nachrichten[i], dict) and nachrichten[i].get('role') == 'assistant':
+        if any(enthaelt_englisch(t) for t in _texte(nachrichten[i])):
             return True
+        i -= 1
     return False
 
 
-def verlauf_fuer_modell_aufraeumen(body: dict, erinnern: bool = True) -> None:
+def verlauf_fuer_modell_aufraeumen(body: dict, erinnern: bool = True, name: str = '') -> None:
     """Vor jedem Modellaufruf: Platzhalter der Zwischenschicht aus den Assistenten-Nachrichten nehmen und leere
     Assistenten-Nachrichten mit Werkzeugaufruf ohne Text schicken (dann setzt die Zwischenschicht keinen Platzhalter ein;
     gemessen an one.intelligence am 13.11.2026: Inhalt '' kostet 22 Eingabe-Token mehr als Inhalt None).
-    Hat das Modell in der laufenden Werkzeugfolge trotzdem eine englische Notiz geschrieben, kommt bis zum Ende dieser
-    Folge eine kurze Erinnerung an Deutsch und an die Person dazu. Sie steht nur in der Anfrage an das Modell, nicht im
-    gespeicherten Verlauf. Ohne englische Notiz kommt nichts dazu: Eine Erinnerung bei jedem Schritt brachte im Test nur
-    mehr Zwischensätze."""
+    Hat das Modell im Aufruf direkt davor trotzdem eine englische Notiz geschrieben, kommt genau in diesen nächsten Aufruf
+    eine kurze Erinnerung an Deutsch und an die Person, danach nicht mehr. Sie steht nur in der Anfrage an das Modell,
+    nicht im gespeicherten Verlauf. Ohne englische Notiz kommt nichts dazu: Eine Erinnerung bei jedem Schritt brachte im
+    Test nur mehr Zwischensätze."""
     nachrichten = body.get('messages')
     if not isinstance(nachrichten, list):
         return
@@ -415,9 +432,9 @@ def verlauf_fuer_modell_aufraeumen(body: dict, erinnern: bool = True) -> None:
             if n.get('tool_calls') and not any(isinstance(t, dict) and str(t.get('text') or '').strip() for t in inhalt if isinstance(t, dict) and t.get('type') in (None, 'text')):
                 rest = [t for t in inhalt if not (isinstance(t, dict) and t.get('type') in (None, 'text'))]
                 n['content'] = rest or None
-    if (erinnern and nachrichten and isinstance(nachrichten[-1], dict) and nachrichten[-1].get('role') == 'tool'
-            and englische_notiz_in_folge(nachrichten)):
-        nachrichten.append({'role': 'user', 'content': ERINNERUNG})
+    if (erinnern and nachrichten and englische_notiz_davor(nachrichten)
+            and not any(t.startswith(_ERINNERUNG_ANFANG) for t in _texte(nachrichten[-1]))):
+        nachrichten.append({'role': 'user', 'content': ERINNERUNG.format(name=_name(name, 'die Person'))})
 
 
 def _texte(nachricht: dict) -> list:
@@ -428,6 +445,270 @@ def _texte(nachricht: dict) -> list:
     if isinstance(inhalt, list):
         return [t['text'] for t in inhalt if isinstance(t, dict) and isinstance(t.get('text'), str)]
     return []
+
+
+def _name(name, ersatz: str) -> str:
+    """Der Name der Person für Hinweis und Erinnerung: einzeilig, ohne eckige Klammern, höchstens 60 Zeichen."""
+    name = re.sub(r'\s+', ' ', re.sub(r'[\[\]]', ' ', str(name or ''))).strip()[:60].strip()
+    return name or ersatz
+
+
+# ---------------------------------------------------------------------- Kurze Form merken (seit 0.4.4)
+# Nach „zu lang“, Eile oder dem Handy gilt laut Anleitung für den Rest des Chats die kurze Form. Im Probe-Bau 9 hielt das
+# Modell sie nur bis zum Bauplan: Beim Abschluss lag Sabines „Das ist zu lang“ 13 Nachrichten und rund 90 Werkzeugaufrufe
+# zurück. Darum sucht der Zusatz vor jedem Modellaufruf in den Nachrichten der Person nach so einer Bitte und hängt dann
+# einen Hinweis ans Ende der Systemanweisung.
+# Wo er steht (Open WebUI 0.12.3, im Labor geprüft): Beim ersten Modellaufruf einer Antwort bekommt der Haken request die
+# Nachrichten noch ohne die Systemanweisung des Modells. Open WebUI fasst danach alle Systemnachrichten zu einer zusammen
+# und setzt die Systemanweisung des Modells davor. Der Zusatz hängt den Hinweis deshalb an die letzte Systemnachricht an
+# oder legt eine an: So steht er im fertigen Aufruf am Ende der Systemanweisung, nicht als Nachricht der Person. Zwischen
+# zwei Werkzeugaufrufen reicht Open WebUI diese Systemnachricht samt Hinweis weiter; dann kommt er kein zweites Mal dazu.
+HINWEIS_KURZ = ('[Hinweis aus deiner Anleitung, er stammt nicht von der Person: {name} hat in diesem Chat um kurze Nachrichten '
+                'gebeten. Bis zum Ende dieses Chats gilt die kurze Form, auch am Kontrollpunkt, in der Abschlussnachricht, in der '
+                'Schärfrunde und in der Übergabe: Nimm dort jeweils die Kurzform. Erwähne diesen Hinweis nicht.]')
+_HINWEIS_ANFANG = '[Hinweis aus deiner Anleitung, er stammt nicht von der Person:'
+_ERINNERUNG_ANFANG = '[Erinnerung aus deiner Anleitung'
+# Zwei Nachrichten mit der Rolle user legt Open WebUI 0.12 selbst an: die Bilder aus Werkzeugausgaben und, wenn ein
+# Terminal angehängt ist, bei jedem Zug die Datei AGENTS.md aus dessen Home vor der ersten Nachricht der Person
+# (utils/terminals.py, add_terminal_agents_md; im Labor hat Annas Terminal eine mit 19.494 Zeichen).
+BILDER_VON_WERKZEUGEN = 'Here are the images from the tool results above'
+AGENTS_MD = '# AGENTS.md'
+# Längere Nachrichten gelten als eingefügter Text (Merkblatt, Mail) und zählen nicht. In den 48 gespeicherten Probe-Chats
+# (488 Nachrichten der Personen) hatte die längste selbst getippte Nachricht 716 Zeichen, die 4 längeren (1.054 bis
+# 1.119) waren eingefügte Merkblätter. Die 6 erkannten Bitten standen in Nachrichten mit 26 bis 262 Zeichen.
+KURZ_GRENZE = 800
+_KURZ_WEG = re.compile(r'<(attached_files|context|source|files?|documents?)\b[^>]*>.*?</\1\s*>|<(?:file|source)\b[^>]*/>'
+                       r'|```.*?```|`[^`\n]*`|https?://\S+|www\.\S+', re.S | re.I)
+# Zitate zählen nicht: In Anwendungen für den Tourismus zitiert die Person oft Gäste („Wartezeit zu lang“) oder Texte
+_KURZ_ZITAT = re.compile(r'„[^“”"\n]{0,400}[“”"]|“[^”\n]{0,400}”|"[^"\n]{0,400}"|»[^«\n]{0,400}«|«[^»\n]{0,400}»|‚[^‘’\n]{0,400}[‘’]')
+# Sätze und Satzteile: getrennt an Satzzeichen und Bindewörtern. Nicht am Doppelpunkt: „Überschrift: zu lang“ meint die
+# Überschrift.
+_KURZ_SATZZEICHEN = re.compile(r'[.!?;\n\r…()\[\]{}/|,–—]+')
+_KURZ_BINDEWORT = frozenset('- und aber oder denn weil sondern deshalb darum daher also dann sonst trotzdem ausserdem'.split())
+_KURZ_UMLAUTE = (('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss'))
+_KURZ_WORT = re.compile(r'[a-z0-9]+')
+_KURZ_VERNEINUNG = frozenset('nicht nich net kein keine keinen keiner keinem keines nie niemals ohne nirgends'.split())
+_KURZ_DU = frozenset('du dich dir dein deine deinen deinem deiner deines euch eure euer'.split())
+# Was zu lang sein kann. Ohne „du“ oder „dein“ daneben bleibt offen, ob die Nachricht des Assistenten gemeint ist oder ein
+# Text der Anwendung („Die Antwort ist zu lang“ in einer Anwendung, die Antworten auf Bewertungen schreibt). „Nachricht“
+# meint im Chat fast immer die Nachrichten des Assistenten und steht deshalb unter den allgemeinen Wörtern.
+_KURZ_BEZUG = frozenset('text texte antwort antworten erklaerung erklaerungen zusammenfassung satz saetze'.split())
+# Wörter, die in einem Satz neben dem Auslöser stehen dürfen: Füllwörter, Pronomen, Hilfsverben, Höflichkeit. Steht noch
+# etwas anderes im Satz („Das Ergebnis ist zu lang für die Tabelle“), geht es um etwas anderes als den Chat.
+_KURZ_ALLGEMEIN = frozenset('''ich mir mich mein meine meinem meinen meiner du dich dir dein deine deinen deinem deiner deines
+    euch eure euer es das dies diese dieser dieses der die den dem des ein eine einen einem einer ist sind war waren wird werden
+    wurde waere waer bin bins hab habe habs kannst koenntest kann koennte geht gehts ginge wuerdest wuerde sollst soll sollte
+    magst muss musst bitte danke sorry sry oh ah puh uff oje hm hmm na ja jo ok okay echt wirklich ziemlich sehr total viel
+    etwas bisschen bissl bissel einfach irgendwie leider ehrlich gesagt schon noch immer mal nur gerade grad grade jetzt heute
+    momentan ab sofort kuenftig zukunft in weiterhin generell insgesamt eigentlich halt eben eh doch so auch wieder ganz schoen
+    hier da alles alle finde find fand denke glaube lesen zum zu fuer mehr nachricht nachrichten'''.split())
+# Am Handy zählt nur, wenn die Person dabei von sich spricht („Ich bin am Handy“, „Bin gerade am Handy“, „ist mir am Handy
+# zu viel“). Sonst ist meist die Anwendung gemeint: „Geht das auch am Handy?“, „Am Rechner passt es, am Handy auch.“ oder
+# die Antwort auf „eher am Handy oder am Rechner“ aus dem Steckbrief (Gegenprüfung Runde 9).
+_KURZ_ICH = frozenset('''ich mir mich mein meine meinem meinen meiner bin bins hab habe habs schreibe schreib tippe tipp lese les
+    sitze haenge unterwegs gerade grad grade momentan'''.split())
+# Nach diesen Wörtern ist „antworten“ das Verb („kürzer antworten“, „kurz und knapp antworten“), keine Antworten der Anwendung
+_KURZ_VOR_VERB = frozenset('kurz kuerzer knapper knapp kurzundknapp lang ausfuehrlich'.split())
+# „Ist das zu lang?“ fragt nach einem Text der Person oder der Anwendung; „Das ist zu lang“ und „Ist mir zu lang“ bitten
+_KURZ_FRAGE = re.compile(r'(?:ist|sind|war|waren|waere|waer|wird|werden|wuerde|wirds)\s+(?:das|es|der|die|dies|diese|dieser|dieses|er|sie)\b')
+
+
+def _woerter(text: str) -> frozenset:
+    return frozenset(text.split())
+
+
+# Auslöser je Art: (Muster, weitere erlaubte Wörter, nötiges Wort oder None (ein Bitte-Wort, beim Handy ein Wort der Person),
+# Bezugswort nur mit „du“/„dein“, Stücke, von denen jeder Auslöser der Art eines enthält: Fehlen sie, läuft das Muster gar
+# nicht erst)
+_KURZ_FAMILIEN = (
+    # zu lang, viel zu lang, zu ausführlich, zu viel Text, weniger Text
+    (re.compile(r'\b(?:viel\s+)?zu\s+lange?\b|\bzulange?\b|\bzu\s+ausfuehrlich\b|\b(?:zu\s+)?viel\s+text\b|\bweniger\s+text\b'),
+     _woerter('lang lange zulang zulange ausfuehrlich weniger text uns'), None, True, ('lang', 'ausfuehrlich', 'text')),
+    # „bitte nicht so lang“ ist eine Bitte, „nicht zu lang“ allein dagegen eine Entwarnung
+    (re.compile(r'\bbitte\s+nicht\s+(?:mehr\s+)?(?:so|zu)\s+(?:lange?|ausfuehrlich|viel)\b|\bnicht\s+(?:so|zu)\s+(?:lange?|ausfuehrlich)\s+bitte\b'
+                r'|\b(?:schreib|schreibe|antworte)\s+(?:bitte\s+)?nicht\s+(?:mehr\s+)?(?:so|zu)\s+(?:lange?|viel|ausfuehrlich)\b'),
+     _woerter('lang lange ausfuehrlich text texte uns schreib schreibe schreiben antworte antworten'), None, True,
+     ('lang', 'ausfuehrlich', 'viel')),
+    # kürzer, knapper
+    (re.compile(r'\bkuerzer(?:e|en|es)?\b|\bknapper(?:e|en)?\b'),
+     _woerter('schreib schreibe schreiben schreibst antworte antworten antwortest fass fasse fassen formulier formuliere formulieren '
+              'halte halten halts sein bleiben bleib deutlich als bisher vorhin zuletzt um gern gerne lieber moechte wuensche haette'),
+     None, True, ('kuerzer', 'knapper')),
+    # kurz bitte, fass dich kurz, kurz und knapp, kurz halten, Kurzfassung bitte; „kurz“ allein ist zu häufig („kurz prüfen“)
+    (re.compile(r'\bkurzundknapp\b|\bkurz(?:fassen|fassung|form|version|halten)?\b|\bkurzen?\s+(?:antworten|nachrichten)\b'),
+     _woerter('schreib schreibe schreiben antworte antworten fass fasse fassen halte halten halts gehalten knapp moeglichst reicht '
+              'reichen genuegt lieber gern gerne moechte wuensche haette um'),
+     _woerter('bitte dich halten halte halts gehalten knapp fassen fass fasse reicht reichen genuegt lieber gern gerne moechte '
+              'wuensche'), True, ('kurz',)),
+    # in Eile, eilig, es eilt, Zeitdruck, im Stress, muss gleich los
+    (re.compile(r'\b(?:in\s+)?eile\b|\beilig\b|\beilt\b|\bzeitdruck\b|\bim\s+stress\b|\bgestresst\b|\bbeeilen\b'
+                r'|\bmuss\s+(?:gleich|bald|sofort|jetzt)\s+(?:los|weg)\b'),
+     _woerter('in es sehr ziemlich stehe unter im muss gleich los weg bald sofort'), None, False,
+     ('eile', 'eilig', 'eilt', 'zeitdruck', 'stress', 'muss')),
+    # keine Zeit, wenig Zeit, nur fünf Minuten
+    (re.compile(r'\b(?:keine|kaum|wenig|nicht\s+viel|nur\s+wenig|nur\s+kurz|nicht\s+lange)\s+zeit\b'
+                r'|\bnur\s+(?:\d+|ein\s+paar|zwei|drei|fuenf|zehn|wenige)\s+minuten\b'),
+     _woerter('zeit minuten lange langen texte nachrichten sowas so was dafuer'), None, False, ('zeit', 'minuten')),
+    # am Handy, vom Handy, auf dem Smartphone
+    (re.compile(r'\b(?:am|vom|auf\s+dem|auf\s+meinem|uebers|ueber\s+das|ueber\s+mein|mit\s+dem|mit\s+meinem)\s+(?:handy|smartphone|iphone)\b'),
+     _woerter('aus unterwegs mobil schreibe schreib tippe tipp lese les sitze haenge beides auf einmal lang lange nachrichten antworten'),
+     _KURZ_ICH, False, ('handy', 'smartphone', 'iphone')),
+    # nur das Wichtigste
+    (re.compile(r'\b(?:nur|bloss)\s+(?:das|die)\s+wichtigsten?\b'),
+     _woerter('sag sage schreib schreibe reicht genuegt'), None, False, ('wichtigst',)),
+)
+_KURZ_VORAB = tuple(sorted({s for f in _KURZ_FAMILIEN for s in f[4]}))
+
+
+def _satz_bittet_um_kuerze(satz: str, arten=_KURZ_FAMILIEN) -> bool:
+    treffer, stellen = [], []
+    for art in arten:
+        if any(s in satz for s in art[4]):
+            for m in art[0].finditer(satz):
+                treffer.append((m.group(0), art))
+                stellen.append(m.span())
+    if not treffer or _KURZ_FRAGE.match(satz):
+        return False
+    # Was außer den Auslösern im Satz steht. Alle Auslöser kommen heraus, auch die anderer Arten („Ich bin am Handy:
+    # bitte kurz“) und überlappende („bitte nicht zu lang“ enthält „zu lang“).
+    zeichen = list(satz)
+    for anfang, ende in stellen:
+        zeichen[anfang:ende] = ' ' * (ende - anfang)
+    rest = _KURZ_WORT.findall(''.join(zeichen))
+    woerter = set(rest)
+    if woerter & _KURZ_VERNEINUNG:
+        return False  # „nicht zu lang“, „keine Eile“, „bin nicht am Handy“
+    folge = _KURZ_WORT.findall(satz)
+    verb = {'antworten'} if any(w == 'antworten' and i and folge[i - 1] in _KURZ_VOR_VERB for i, w in enumerate(folge)) else set()
+    for gefunden, (_, erlaubt, bitte, bezug, _) in treffer:
+        if bitte is not None and gefunden != 'kurzundknapp' and not woerter & bitte:
+            continue  # „kurz“ allein: „Ich schaue kurz nach“; „am Handy“ ohne die Person: „Geht das auch am Handy?“
+        if bezug and (woerter & _KURZ_BEZUG) - verb and not woerter & _KURZ_DU:
+            continue  # „Die Antwort ist zu lang“ kann die Anwendung meinen
+        if all(w in _KURZ_ALLGEMEIN or w in erlaubt or w in _KURZ_BEZUG for w in rest):
+            return True
+    return False
+
+
+def bittet_um_kuerze(text: str) -> bool:
+    """True, wenn ein Text der Person um kurze Nachrichten bittet oder Eile, keine Zeit oder das Handy nennt. Bewusst
+    vorsichtig: Ein Satz zählt nur, wenn außer dem Auslöser nur Wörter darin stehen, die zum Chat oder zur Lage der Person
+    passen. Nicht zählen: Texte über KURZ_GRENZE Zeichen, Verneintes („nicht zu lang“, „keine Eile“), Zitate, Code, Links,
+    angehängte Dateien und Wörter, die den Auslöser nur enthalten („Zulassung“, „Handyhülle“)."""
+    if not isinstance(text, str) or not text.strip() or len(text) > 20 * KURZ_GRENZE:
+        return False  # leer, oder ein ganzes eingefügtes Dokument
+    if '<user_query>' in text:  # Vorlage für Quellen (RAG): nur die Frage der Person zählt
+        frage = re.search(r'<user_query>(.*?)</user_query>', text, re.S)
+        text = frage.group(1) if frage else ''
+    klein = _kurz_klein(text)
+    stuecke = [s for s in _KURZ_VORAB if s in klein]
+    if not stuecke:
+        return False  # schneller Vorfilter: kein Stück eines Auslösers im Text
+    arten = [art for art in _KURZ_FAMILIEN if any(s in stuecke for s in art[4])]
+    roh = text
+    if text.count('<') > 30:
+        return False  # eingefügtes HTML oder XML; bei vielen offenen Marken rechnete _KURZ_WEG über eine Sekunde
+    if '<' in text or '`' in text or 'http' in text or 'www.' in text:
+        text = _KURZ_WEG.sub(' ', text)
+    if any(z in text for z in '„“"»«‚'):
+        text = _KURZ_ZITAT.sub(' ', text)
+    text = text.strip()
+    if not text or len(text) > KURZ_GRENZE:
+        return False
+    if text != roh.strip():
+        klein = _kurz_klein(text)
+    t = re.sub(r'\bkurz\s+(?:und|&)\s+knapp\b', 'kurzundknapp', re.sub(r"['’`´]", '', klein))
+    for teil in _KURZ_SATZZEICHEN.split(t):
+        if not any(s in teil for s in stuecke):
+            continue
+        satz = []
+        for wort in teil.split() + ['-']:  # das angehängte „-“ schließt den letzten Satzteil ab
+            if wort not in _KURZ_BINDEWORT:
+                satz.append(wort)
+            elif satz:
+                if _satz_bittet_um_kuerze(' '.join(satz), arten):
+                    return True
+                satz = []
+    return False
+
+
+def _kurz_klein(text: str) -> str:
+    t = text.lower()
+    for alt, neu in _KURZ_UMLAUTE:
+        t = t.replace(alt, neu)
+    return t
+
+
+_kurz_merker: dict = {}  # Ergebnis je Nachricht; Schlüssel ist eine Prüfsumme, nicht der Text
+
+
+def _bittet_gemerkt(text: str) -> bool:
+    """bittet_um_kuerze mit Gedächtnis: Vor jedem Modellaufruf kommen dieselben Nachrichten wieder (bis zu 90 Aufrufe je
+    Antwort); jede wird nur einmal geprüft."""
+    schluessel = hashlib.blake2b(text.encode('utf-8', 'replace'), digest_size=16).digest()
+    ergebnis = _kurz_merker.get(schluessel)
+    if ergebnis is None:
+        ergebnis = bittet_um_kuerze(text)
+        if len(_kurz_merker) >= 4096:
+            _kurz_merker.clear()
+        _kurz_merker[schluessel] = ergebnis
+    return ergebnis
+
+
+def um_kuerze_gebeten(nachrichten: list) -> bool:
+    """True, wenn die Person in einer ihrer Nachrichten dieses Chats um Kürze gebeten hat. Es zählen nur Nachrichten mit
+    der Rolle user, nicht Werkzeugausgaben, nicht Hinweis und Erinnerung dieses Zusatzes, nicht die Nachrichten, die Open
+    WebUI selbst anlegt (Bilder aus Werkzeugen, AGENTS.md des Terminals), und nur Textteile (keine Bilder, keine
+    angehängten Dateien)."""
+    for n in nachrichten:
+        if not isinstance(n, dict) or n.get('role') != 'user' or _bilder_der_werkzeuge(n):
+            continue
+        text = '\n'.join(_texte(n)).strip()
+        if not text or text.startswith((_HINWEIS_ANFANG, _ERINNERUNG_ANFANG, AGENTS_MD)):
+            continue
+        if _bittet_gemerkt(text):
+            return True
+    return False
+
+
+def _mit_hinweis(nachricht: dict, hinweis: str) -> dict:
+    """Kopie einer Systemnachricht mit dem Hinweis am Ende. Bei einer Liste von Teilen kommt er in den ersten Textteil:
+    Nur den übernimmt Open WebUI, wenn es die Systemnachrichten zusammenfasst (merge_system_messages)."""
+    neu = dict(nachricht)
+    inhalt = nachricht.get('content')
+    if isinstance(inhalt, list):
+        teile, gesetzt = [], False
+        for t in inhalt:
+            if not gesetzt and isinstance(t, dict) and t.get('type') == 'text' and isinstance(t.get('text'), str):
+                t, gesetzt = dict(t, text=(t['text'].rstrip() + '\n\n' + hinweis) if t['text'].strip() else hinweis), True
+            teile.append(t)
+        neu['content'] = teile if gesetzt else [{'type': 'text', 'text': hinweis}, *inhalt]
+    elif isinstance(inhalt, str) and inhalt.strip():
+        neu['content'] = inhalt.rstrip() + '\n\n' + hinweis
+    else:
+        neu['content'] = hinweis
+    return neu
+
+
+def kurze_form_hinweis(body: dict, name: str = '') -> bool:
+    """Vor jedem Modellaufruf: Hat die Person in diesem Chat um Kürze gebeten, steht genau ein Hinweis darauf am Ende der
+    Systemanweisung. Ohne Auslöser kommt nichts dazu. Der Hinweis steht nur in der Anfrage, nie im gespeicherten Verlauf.
+    Gibt zurück, ob er jetzt in der Anfrage steht."""
+    nachrichten = body.get('messages')
+    if not isinstance(nachrichten, list):
+        return False
+    systeme = [i for i, n in enumerate(nachrichten) if isinstance(n, dict) and n.get('role') == 'system']
+    if any(_HINWEIS_ANFANG in t for i in systeme for t in _texte(nachrichten[i])):
+        return True  # aus dem ersten Modellaufruf dieser Antwort weitergereicht
+    if not um_kuerze_gebeten(nachrichten):
+        return False
+    hinweis = HINWEIS_KURZ.format(name=_name(name, 'Die Person'))
+    if systeme:
+        # Kopie statt Änderung an Ort und Stelle: Open WebUI verwendet dieselbe Systemnachricht weiter
+        nachrichten[systeme[-1]] = _mit_hinweis(nachrichten[systeme[-1]], hinweis)
+    else:
+        nachrichten.insert(0, {'role': 'system', 'content': hinweis})
+    return True
 
 
 def _letzte_der_person(body: dict):
@@ -491,8 +772,11 @@ class Filter:
                                         json_schema_extra={'input': {'type': 'password'}})
         nur_terminal: str = Field(default='one-compute-buildbar',
                                   description='Nur in dieses Terminal schreiben (ID der Terminal-Verbindung). Leer: jedes')
-        erinnerung_deutsch: bool = Field(default=True, description='Nach einer englischen Arbeitsnotiz mitten in einer Werkzeugfolge an '
+        erinnerung_deutsch: bool = Field(default=True, description='Nach einer englischen Arbeitsnotiz im nächsten Modellaufruf einmal an '
                                          'Deutsch und an die Person erinnern (steht nur in der Anfrage an das Modell, nicht im Verlauf)')
+        kurze_form_merken: bool = Field(default=True, description='Hat die Person im Chat um Kürze gebeten („zu lang“, „kürzer“, Eile, '
+                                        'keine Zeit, Handy), bekommt das Modell vor jedem Aufruf am Ende der Systemanweisung den '
+                                        'Hinweis, dass bis zum Ende des Chats die kurze Form gilt (nur in der Anfrage, nicht im Verlauf)')
         antwort_aufraeumen: bool = Field(default=True, description='Technische Platzhalter und englische Arbeitsnotizen aus der '
                                          'fertigen Antwort nehmen')
         vorschlagsknoepfe_aus: bool = Field(default=True, description='Die automatisch erzeugten Vorschlagsknöpfe unter jeder Antwort '
@@ -528,15 +812,23 @@ class Filter:
 
     async def request(self, body: dict, __user__: dict = None) -> dict:
         """Läuft vor jedem Modellaufruf, auch zwischen Werkzeugaufrufen: blendet Schlüssel und Zugangszeichen aus allen
-        Nachrichten aus, auch aus Werkzeugausgaben (etwa wenn der Assistent doch eine Zugangsdatei gelesen hat)."""
+        Nachrichten aus, auch aus Werkzeugausgaben (etwa wenn der Assistent doch eine Zugangsdatei gelesen hat). Danach
+        räumt er auf, erinnert nach einer englischen Notiz einmal an Deutsch und hängt nach einer Bitte um Kürze den
+        Hinweis auf die kurze Form an die Systemanweisung."""
         try:
             schluessel_ersetzen(body, {}, standard=AUSGEBLENDET, genau=self._genaue_werte(__user__))
         except Exception as e:
             log.warning('buildbar Zugang, request: %s', type(e).__name__)
-        try:  # Platzhalter der Zwischenschicht heraus, Erinnerung an Deutsch mitten in einer Werkzeugfolge
-            verlauf_fuer_modell_aufraeumen(body, erinnern=bool(self.valves.erinnerung_deutsch))
+        name = (__user__ or {}).get('name') if isinstance(__user__, dict) else ''
+        try:  # Platzhalter der Zwischenschicht heraus, Erinnerung an Deutsch direkt nach einer englischen Notiz
+            verlauf_fuer_modell_aufraeumen(body, erinnern=bool(self.valves.erinnerung_deutsch), name=name)
         except Exception as e:
             log.warning('buildbar Zugang, request (Aufräumen): %s', type(e).__name__)
+        try:  # seit 0.4.4: kurze Form bis zum Ende des Chats, wenn die Person darum gebeten hat
+            if self.valves.kurze_form_merken:
+                kurze_form_hinweis(body, name)
+        except Exception as e:
+            log.warning('buildbar Zugang, request (kurze Form): %s', type(e).__name__)
         return body
 
     async def outlet(self, body: dict, __user__: dict = None, __metadata__: dict = None, __event_emitter__=None) -> dict:

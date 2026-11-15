@@ -38,11 +38,31 @@ Admin, Funktionen, neue Funktion. Code: [`openwebui/buildbar_zugang.py`](openweb
 
 | Valve | Wert |
 |---|---|
-| `n8n_url` | `https://n8n.oi.destination.one` |
+| `n8n_url` | `https://n8n.oi.destination.one` (diese n8n rufen auch neue Apps auf) |
 | `hub_url` | `https://oi-labor-hub.friedemann-schuetz.eu` (Bereitstellungsdienst für die Apps) |
 | `hub_kurs_geheimnis` | Kurs-Geheimnis des Bereitstellungsdienstes, kommt von Friedemann auf sicherem Weg |
 | `nur_terminal` | `one-compute-buildbar` (Standard; schreibt die Zugänge nur in dieses Terminal) |
 | `priority` | `-100` (Standard; läuft vor anderen Filtern) |
+| `kurze_form_merken`, `erinnerung_deutsch`, `antwort_aufraeumen`, `vorschlagsknoepfe_aus` | an (Standard; was sie tun, steht direkt unter dieser Liste) |
+
+- Was der Zusatz außer den Zugängen am Chat tut (Fassung 0.4.4, jeder Punkt mit seinem Schalter abschaltbar):
+  - **Kurze Form merken** (`kurze_form_merken`): Hat die Person in diesem Chat „zu lang“, „kürzer“ oder „kurz bitte“
+    geschrieben oder Eile, keine Zeit oder das Handy erwähnt, hängt der Zusatz vor jedem Modellaufruf einen kurzen
+    Hinweis ans Ende der Systemanweisung: Bis zum Ende des Chats gilt die kurze Form, auch am Kontrollpunkt, in der
+    Abschlussnachricht, in der Schärfrunde und in der Übergabe. Es zählen nur Nachrichten der Person bis 800 Zeichen
+    und darin nur Sätze, die sich auf den Chat oder ihre Lage beziehen. Nicht zählen etwa „Das Ergebnis ist zu lang für
+    die Tabelle“, „nicht zu lang“, „bin am Handy erreichbar“, Fragen wie „Ist das zu lang?“ oder „Geht das auch am
+    Handy?“ (am Handy zählt nur, wenn die Person von sich spricht), Zitate, eingefügte Texte, angehängte Dateien und die
+    Datei `AGENTS.md` des Terminals, die Open WebUI selbst als Nachricht mitschickt.
+  - **Erinnerung an Deutsch** (`erinnerung_deutsch`): Schreibt das Modell zwischen zwei Werkzeugaufrufen eine englische
+    Notiz, bekommt der nächste Modellaufruf einmal eine kurze Erinnerung: Was es für die Person schreibt, ist ein kurzer
+    deutscher Satz.
+  - **Aufräumen** (`antwort_aufraeumen`): Englische Notizen und den Platzhalter der Zwischenschicht nimmt er aus der
+    fertigen Antwort.
+  - **Vorschlagsknöpfe** (`vorschlagsknoepfe_aus`): Die automatisch erzeugten Folgefragen unter jeder Antwort entfernt
+    er wieder.
+
+  Hinweis und Erinnerung stehen nur in der Anfrage an das Modell, nie im gespeicherten Verlauf.
 
 - **Open WebUI mit `ENABLE_VALVE_ENCRYPTION=true` betreiben** (und auf allen Instanzen derselbe `WEBUI_SECRET_KEY`). Ohne diese
   Einstellung speichert Open WebUI persönliche Einstellungen im Klartext und schickt sie an den Browser, also auch den
@@ -116,7 +136,7 @@ Webseite lesen). Alle Bausteine sind ein Angebot, keine Pflicht, und für jeden 
 | `/usr/local/bin/buildbar-merken` | merkt sich Zugänge, die die Person in einem eigenen Workflow ausgewählt hat |
 | `/usr/local/bin/n8n-werkzeug` | ruft die n8n-mcp-Werkzeuge im n8n-Konto der Person auf |
 | `/usr/local/bin/n8n-mcp-start` | startet n8n-mcp 2.91.0 (ohne Löschen, Zugänge, Instanz-Audit, Agenten und Evaluations), ohne Telemetrie |
-| `/usr/local/bin/app` | App anlegen, auflisten, ansehen und veröffentlichen (über den Bereitstellungsdienst). `app ansehen` baut die App im Arbeitsplatz, startet sie nur lokal und prüft sie im Browser, ohne etwas zu veröffentlichen. `app veroeffentlichen` prüft vorher lokal und danach die echte Adresse. Es läuft immer nur ein Bau (Sperre `/tmp/buildbar-bau.lock`, der Arbeitsplatz hat 2 GB) |
+| `/usr/local/bin/app` | App anlegen, auflisten, ansehen, sichern und veröffentlichen (über den Bereitstellungsdienst). `app neu` stellt die Vorlage auf die n8n aus `N8N_API_URL` um (nur Schema und Host, ohne Angabe `https://n8n.oi.destination.one`). `app ansehen` baut die App im Arbeitsplatz, startet sie nur lokal und prüft sie im Browser, ohne etwas zu veröffentlichen. `app veroeffentlichen` prüft vorher lokal und danach die echte Adresse. `app sichern "<was>"` überträgt nur Bericht, Stand, Notizen und Workflow-Dateien (`pruefbericht.md`, `stand.md`, `mein-use-case.md`, `README.md`, `workflows/*.json`) nach Gitea und kehrt sofort zurück, ohne Bau, Vorprüfung und Warten. Hat sich seit dem letzten Stand auf Gitea noch etwas anderes geändert, überträgt es nichts und meldet `NICHT GESICHERT` mit den Dateien, dann gilt `app veroeffentlichen`. Es läuft immer nur ein Bau (Sperre `/tmp/buildbar-bau.lock`, der Arbeitsplatz hat 2 GB) |
 | `/usr/local/bin/seite-pruefen` | prüft eine Oberfläche im Browser: Bilder Rechner und Handy (am Handy wie ein echtes Gerät neu geladen), Überbreite, sehr kleine Schrift (am Bildschirm unter 11 px, auch die Beschriftung einer verkleinert gezeigten Zeichnung), Kontrast, Fehler. Schritt `datei` lädt eine Datei aus dem Ordner der App oder aus `/tmp` in ein Dateifeld. Nur eigene Apps und, mit `SEITE_PRUEFEN_LOKAL=1`, die lokal gestartete App; interne Adressen sind gesperrt |
 | `/usr/local/bin/workflow-pruefen` | prüft einen n8n-Workflow auf stille Fehler (Name, Ausdruck ohne „=“, Webhook und Antwort, offene Weiterleitung, Kosten ohne Tageszähler, Code, KI, Zugänge) |
 | `/usr/local/bin/datei-ansehen` | liest eine angehängte Tabelle ganz (Spalten, Summen, Kontrollzeilen) und blendet Personendaten aus, bevor geplant wird |
