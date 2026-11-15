@@ -1,7 +1,7 @@
 """
 title: buildbar Zugang
 author: Friedemann Schütz
-version: 0.4.4
+version: 0.4.5
 required_open_webui_version: 0.12.0
 description: Legt n8n-Schlüssel, Kürzel und Zugang zum Veröffentlichen unsichtbar im Terminal der Person ab. Fängt einen in den Chat eingefügten n8n-Schlüssel ab, bevor das Modell ihn sieht, und ersetzt ihn auch im gespeicherten Verlauf.
 """
@@ -32,7 +32,8 @@ description: Legt n8n-Schlüssel, Kürzel und Zugang zum Veröffentlichen unsich
 # Seit 0.4.4 merkt er sich außerdem, wenn die Person in diesem Chat um Kürze gebeten hat („zu lang“, „kürzer“, Eile,
 # keine Zeit, Handy). Dann hängt er vor jedem Modellaufruf einen kurzen Hinweis ans Ende der Systemanweisung: Bis zum
 # Ende des Chats gilt die kurze Form (abschaltbar). Hinweis und Erinnerung stehen nur in der Anfrage an das Modell, nie im
-# gespeicherten Verlauf.
+# gespeicherten Verlauf. Seit 0.4.5 sagt der Hinweis auch, wo die eine Frage steht (Zeile 2 oder 3): In Probe-Bau 10 stand
+# sie in der Schärfrunde trotz Kurzform wieder in der letzten Zeile.
 #
 # Grenzen, die dieser Filter nicht schließen kann (für den Betrieb):
 # - Erste Nachricht eines neuen Chats: Open WebUI erzeugt den Chat-Titel aus dem Klartext, bevor ein Filter läuft. Steht
@@ -465,7 +466,8 @@ def _name(name, ersatz: str) -> str:
 # zwei Werkzeugaufrufen reicht Open WebUI diese Systemnachricht samt Hinweis weiter; dann kommt er kein zweites Mal dazu.
 HINWEIS_KURZ = ('[Hinweis aus deiner Anleitung, er stammt nicht von der Person: {name} hat in diesem Chat um kurze Nachrichten '
                 'gebeten. Bis zum Ende dieses Chats gilt die kurze Form, auch am Kontrollpunkt, in der Abschlussnachricht, in der '
-                'Schärfrunde und in der Übergabe: Nimm dort jeweils die Kurzform. Erwähne diesen Hinweis nicht.]')
+                'Schärfrunde und in der Übergabe: Nimm dort jeweils die Kurzform, mit deiner einen Frage oder Bitte in Zeile 2 '
+                'oder 3, nicht am Ende. Erwähne diesen Hinweis nicht.]')
 _HINWEIS_ANFANG = '[Hinweis aus deiner Anleitung, er stammt nicht von der Person:'
 _ERINNERUNG_ANFANG = '[Erinnerung aus deiner Anleitung'
 # Zwei Nachrichten mit der Rolle user legt Open WebUI 0.12 selbst an: die Bilder aus Werkzeugausgaben und, wenn ein
